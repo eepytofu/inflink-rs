@@ -2,6 +2,17 @@
 
 为网易云音乐提供 SMTC 和 Discord RPC 支持。
 
+## fork stuff
+
+sorry for the english, 我的中文不好.
+
+* song, artist and cover on the discord card are clickable
+* artists can be joined with a comma (default) or a slash
+* third line can be album (default) or the quality netease actually delivered (e.g. `Lossless`, `Lossless · FLAC 48 kHz, 1104 kbps`)
+* small icon is no longer cropped
+* english settings page
+* plugin API has more song fields and `getCurrentAudioInfo()`, see [docs/inflink-api.md](./docs/inflink-api.md)
+
 ## 使用方法
 
 ### 通过插件商店安装
