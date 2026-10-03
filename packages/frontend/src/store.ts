@@ -1,6 +1,12 @@
 import { atom } from "jotai";
 import { atomWithStorage } from "jotai/utils";
-import type { DiscordDisplayMode } from "./types/backend";
+import type { Language } from "./i18n";
+import type {
+	DiscordAppNameModeType,
+	DiscordArtistSeparator,
+	DiscordDisplayMode,
+	DiscordThirdLine,
+} from "./types/backend";
 import type { LogLevel } from "./utils/logger";
 
 const STORE_KEY_BASE = "inflink-rs";
@@ -35,9 +41,53 @@ export const discordDisplayModeAtom = atomWithStorage<DiscordDisplayMode>(
 	"Name",
 );
 
-export const discordAppNameModeTypeAtom = atomWithStorage<
-	"Default" | "Song" | "Artist" | "Album" | "Custom"
->(STORE_KEY_DISCORD_APP_NAME_MODE_TYPE, "Default");
+export const discordAppNameModeTypeAtom =
+	atomWithStorage<DiscordAppNameModeType>(
+		STORE_KEY_DISCORD_APP_NAME_MODE_TYPE,
+		"Default",
+	);
+
+export const DISCORD_THIRD_LINES: readonly DiscordThirdLine[] = [
+	"Album",
+	"Tier",
+	"TierAndAlbum",
+	"Full",
+	"Compact",
+];
+
+export const discordThirdLineAtom = atomWithStorage<DiscordThirdLine>(
+	`${STORE_KEY_BASE}.discord_third_line`,
+	"Album",
+);
+
+/**
+ * 后端遇到不认识的取值会拒绝整条 Discord 配置，
+ * 所以存储里残留的旧取值要先换回默认值
+ */
+export function toThirdLine(value: unknown): DiscordThirdLine {
+	return DISCORD_THIRD_LINES.find((v) => v === value) ?? "Album";
+}
+
+export const discordArtistSeparatorAtom =
+	atomWithStorage<DiscordArtistSeparator>(
+		`${STORE_KEY_BASE}.discord_artist_separator`,
+		"Comma",
+	);
+
+export const discordShowTranslationAtom = atomWithStorage<boolean>(
+	`${STORE_KEY_BASE}.discord_show_translation`,
+	false,
+);
+
+export const discordLinksAtom = atomWithStorage<boolean>(
+	`${STORE_KEY_BASE}.discord_links`,
+	true,
+);
+
+export const languageAtom = atomWithStorage<Language>(
+	`${STORE_KEY_BASE}.language`,
+	"zh",
+);
 
 export const discordCustomAppNameTextAtom = atomWithStorage<string>(
 	STORE_KEY_DISCORD_CUSTOM_APP_NAME_TEXT,
@@ -84,5 +134,9 @@ export const appConfigAtom = atom((get) => {
 		discordShowPaused: get(discordShowPausedAtom),
 		discordDisplayMode: get(discordDisplayModeAtom),
 		appNameMode,
+		discordThirdLine: toThirdLine(get(discordThirdLineAtom)),
+		discordArtistSeparator: get(discordArtistSeparatorAtom),
+		discordShowTranslation: get(discordShowTranslationAtom),
+		discordLinks: get(discordLinksAtom),
 	};
 });

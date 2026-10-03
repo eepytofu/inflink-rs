@@ -1,5 +1,5 @@
 /** biome-ignore-all lint/complexity/useLiteralKeys: 和 ts 配置 noPropertyAccessFromIndexSignature 冲突 */
-import type { AudioDataInfo, PlayMode, SongInfo } from "@/types/api";
+import type { AudioDataInfo, AudioInfo, PlayMode, SongInfo } from "@/types/api";
 import {
 	DomElementNotFoundError,
 	InconsistentStateError,
@@ -17,6 +17,7 @@ import {
 } from "@/utils";
 import logger from "@/utils/logger";
 import { BaseNcmAdapter } from "../baseAdapter";
+import { firstNonEmpty, parseCatalogId, toArtistInfos } from "../metadata";
 import { type AudioPlayer, AudioPlayerWrapper } from "./audioPlayerWrapper";
 import { patchInternalLogger } from "./patchInternalLogger";
 
@@ -146,6 +147,104 @@ async function waitForReduxStore(timeoutMs = 10000): Promise<v3.NCMStore> {
 }
 
 /**
+ * 当前歌曲的 ID，与 `SongInfo.ncmId` 的取值规则一致
+ *
+ * 没有匹配到曲库的本地歌曲返回 0，没有歌曲时返回 null
+ */
+function resolveTrackId(playingInfo: v3.PlayingInfo): number | null {
+	const trackIdSource =
+		(playingInfo.trackFileType === "local" && playingInfo.onlineResourceId) ||
+		playingInfo.resourceTrackId;
+
+	if (!trackIdSource) {
+		return null;
+	}
+
+	const trackIdStr = String(trackIdSource);
+	if (/^\d+$/.test(trackIdStr) && trackIdStr !== "0") {
+		const trackId = parseInt(trackIdStr, 10);
+		return Number.isNaN(trackId) ? null : trackId;
+	}
+	return 0;
+}
+
+type StreamCacheGetter = () => Map<string, v3.StreamInfo>;
+
+function isStreamInfo(value: unknown): value is v3.StreamInfo {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"br" in value &&
+		"type" in value &&
+		"url" in value
+	);
+}
+
+/**
+ * 寻找网易云保存音频流信息的模块
+ *
+ * 那个模块导出一个以歌曲 ID 为键的 Map。导出名是压缩后的单字母，模块 ID 也会随
+ * 版本变化，所以按内容的形状来找。Map 为空时无法辨认，调用方应在之后重试。
+ */
+function findStreamCache(require: WebpackRequire): StreamCacheGetter | null {
+	for (const id in require.c) {
+		const exports = require.c[id]?.exports;
+		if (typeof exports !== "object" || exports === null) continue;
+
+		let keys: string[];
+		try {
+			keys = Object.keys(exports);
+		} catch {
+			continue;
+		}
+		if (keys.length > 64) continue;
+
+		for (const key of keys) {
+			try {
+				const value = (exports as Record<string, unknown>)[key];
+				if (!(value instanceof Map) || value.size === 0) continue;
+
+				const [firstKey, firstValue] = value.entries().next().value ?? [];
+				if (typeof firstKey === "string" && isStreamInfo(firstValue)) {
+					// 每次都从导出对象上重新取，以免模块内部替换掉这个 Map
+					return () =>
+						(exports as Record<string, unknown>)[key] as Map<
+							string,
+							v3.StreamInfo
+						>;
+				}
+			} catch {
+				// 某些导出是会抛错的 getter，跳过即可
+			}
+		}
+	}
+	return null;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.round(value)
+		: undefined;
+}
+
+function toAudioInfo(ncmId: number, stream: v3.StreamInfo): AudioInfo {
+	const codec =
+		typeof stream.type === "string" && stream.type.trim() !== ""
+			? stream.type.trim().toLowerCase()
+			: undefined;
+	return {
+		ncmId,
+		codec,
+		bitrate: positiveInteger(stream.br),
+		sampleRate: positiveInteger(stream.sr),
+		level:
+			typeof stream.level === "string" && stream.level !== ""
+				? stream.level
+				: undefined,
+	};
+}
+
+/**
  * CSS 选择器常量
  */
 const SELECTORS = {
@@ -167,8 +266,14 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 	private lastIsPlaying: boolean | null = null;
 	private lastPlayMode: string | undefined = undefined;
 
+	private webpackRequire: WebpackRequire | null = null;
+	private streamCache: StreamCacheGetter | null = null;
+	private lastAudioInfoKey: string | null = null;
+	private pendingAudioInfoPlayId: string | null = null;
+
 	public async initialize(): Promise<void> {
 		const require = await getWebpackRequire();
+		this.webpackRequire = require;
 
 		if (import.meta.env.DEV) {
 			patchInternalLogger(require, () => this.isInternalLoggingEnabled);
@@ -439,6 +544,7 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 				cover: currentVoice.coverUrl ? { url: currentVoice.coverUrl } : null,
 				ncmId: voiceId,
 				duration: duration > 0 ? duration : undefined,
+				type: "podcast",
 			};
 		}
 
@@ -452,24 +558,8 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 			playingInfo.resourceName ??
 			"未知专辑";
 
-		const trackIdSource =
-			(playingInfo.trackFileType === "local" && playingInfo.onlineResourceId) ||
-			playingInfo.resourceTrackId;
-
-		if (!trackIdSource) {
-			return null;
-		}
-
-		let currentTrackId: number;
-		const trackIdStr = String(trackIdSource);
-
-		if (/^\d+$/.test(trackIdStr) && trackIdStr !== "0") {
-			currentTrackId = parseInt(trackIdStr, 10);
-		} else {
-			currentTrackId = 0;
-		}
-
-		if (Number.isNaN(currentTrackId)) {
+		const currentTrackId = resolveTrackId(playingInfo);
+		if (currentTrackId === null) {
 			return null;
 		}
 
@@ -480,6 +570,10 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 			duration = playingInfo.curTrack.duration;
 		}
 
+		const alias = playingInfo.curTrack?.alias?.filter(
+			(v) => typeof v === "string" && v !== "",
+		);
+
 		return {
 			songName: playingInfo.resourceName || "未知歌名",
 			authorName:
@@ -489,7 +583,60 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 			cover: coverUrl ? { url: coverUrl } : null,
 			ncmId: currentTrackId,
 			duration: duration > 0 ? duration : undefined,
+			artists: toArtistInfos(playingInfo.resourceArtists),
+			albumId: parseCatalogId(playingInfo.curTrack?.album?.id),
+			transName: firstNonEmpty(playingInfo.curTrack?.transNames),
+			alias: alias?.length ? alias : undefined,
+			type: currentTrackId > 0 ? "song" : "local",
 		};
+	}
+
+	/**
+	 * 从网易云留在内存里的音频流信息读取当前歌曲的真实规格
+	 *
+	 * 只在 playId 或音质档位变化时读一次，不轮询、不发请求。条目必须属于当前
+	 * 歌曲才会采用，否则预加载的下一首歌或者上一首歌的规格会被错当成当前的。
+	 */
+	private refreshAudioInfo(): void {
+		const playingInfo = this.reduxStore?.getState().playing;
+		const trackId = playingInfo ? resolveTrackId(playingInfo) : null;
+		if (!playingInfo || !trackId || playingInfo.resourceType === "voice") {
+			this.pendingAudioInfoPlayId = null;
+			this.updateAudioInfo(null);
+			return;
+		}
+
+		const stream = this.findStreamInfo(String(trackId));
+		if (!stream) {
+			// 地址请求可能还没回来，等这次播放的第一个进度事件再读一次
+			this.pendingAudioInfoPlayId = playingInfo.playId ?? null;
+			if (this.audioInfo?.ncmId !== trackId) {
+				this.updateAudioInfo(null);
+			}
+			return;
+		}
+
+		this.pendingAudioInfoPlayId = null;
+		this.updateAudioInfo(toAudioInfo(trackId, stream));
+	}
+
+	private findStreamInfo(trackId: string): v3.StreamInfo | null {
+		if (!this.streamCache && this.webpackRequire) {
+			this.streamCache = findStreamCache(this.webpackRequire);
+			if (this.streamCache) {
+				logger.debug("找到音频流信息缓存", "Adapter V3");
+			}
+		}
+
+		try {
+			const entry = this.streamCache?.().get(trackId);
+			if (entry && String(entry.id) === trackId) {
+				return entry;
+			}
+		} catch (e) {
+			logger.warn("读取音频流信息失败:", "Adapter V3", e);
+		}
+		return null;
 	}
 
 	public getPlayMode(): PlayMode {
@@ -590,6 +737,13 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 			}
 		}
 
+		// playId 每次加载音频都会变，音质档位在同一首歌内切换音质时会变
+		const audioInfoKey = `${playingInfo.resourceTrackId ?? ""}|${playingInfo.playId ?? ""}|${playingInfo.resourcePlayingQuality ?? ""}`;
+		if (audioInfoKey !== this.lastAudioInfoKey) {
+			this.lastAudioInfoKey = audioInfoKey;
+			this.refreshAudioInfo();
+		}
+
 		if (this.lastIsPlaying === null) {
 			const isPlaying = playingInfo.playingState === 2;
 			this.lastIsPlaying = isPlaying;
@@ -668,6 +822,15 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 		e: ParsedEventMap["progressUpdate"],
 	): void => {
 		if (!this.isProgressForCurrentTrack(e.detail.playId)) return;
+
+		if (
+			this.pendingAudioInfoPlayId !== null &&
+			this.pendingAudioInfoPlayId === e.detail.playId
+		) {
+			this.refreshAudioInfo();
+			// 这次还读不到就不再重试，等下一次 playId 或音质变化
+			this.pendingAudioInfoPlayId = null;
+		}
 
 		if (this.ignoreNextZeroProgressEvent && e.detail.currentMs === 0) {
 			this.ignoreNextZeroProgressEvent = false;

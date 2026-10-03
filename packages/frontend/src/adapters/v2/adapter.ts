@@ -19,6 +19,7 @@ import {
 } from "@/utils";
 import logger from "@/utils/logger";
 import { BaseNcmAdapter } from "../baseAdapter";
+import { parseCatalogId, toArtistInfos } from "../metadata";
 
 const Controller = typeof ctl !== "undefined" ? ctl : null;
 const DataController = typeof dc !== "undefined" ? dc : null;
@@ -349,6 +350,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 				cover: songData.album.picUrl ? { url: songData.album.picUrl } : null,
 				ncmId: ncmId,
 				duration: getDuration(),
+				type: "local",
 			};
 		}
 
@@ -365,6 +367,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 					cover: programCache.coverUrl ? { url: programCache.coverUrl } : null,
 					ncmId: programCache.id,
 					duration: getDuration(),
+					type: "podcast",
 				};
 			}
 
@@ -377,6 +380,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 				cover: radioPic ? { url: radioPic } : null,
 				ncmId: songData.programId,
 				duration: getDuration(),
+				type: "podcast",
 			};
 		}
 
@@ -388,6 +392,10 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 			cover: songData.album?.picUrl ? { url: songData.album.picUrl } : null,
 			ncmId: songData.id,
 			duration: getDuration(),
+			artists: toArtistInfos(songData.artists),
+			albumId: parseCatalogId(songData.album?.id),
+			alias: songData.alias?.length ? songData.alias : undefined,
+			type: "song",
 		};
 	}
 

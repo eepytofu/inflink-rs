@@ -110,6 +110,7 @@ fn run_dispatcher_loop(rx: &Receiver<AppMessage>) {
                     error!("更新 SMTC 元数据失败: {e:?}");
                 }
             }
+            AppMessage::UpdateAudioInfo(payload) => discord::update_audio_info(payload),
             AppMessage::UpdatePlayState(payload) => {
                 discord::update_play_state(payload.clone());
 

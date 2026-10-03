@@ -30,6 +30,7 @@ impl AsRef<MetadataPayload> for SharedMetadata {
 #[serde(tag = "type", content = "payload")]
 pub enum AppMessage {
     UpdateMetadata(MetadataUpdate),
+    UpdateAudioInfo(AudioInfoPayload),
 
     UpdatePlayState(PlayStatePayload),
     UpdateTimeline(TimelinePayload),
@@ -52,6 +53,24 @@ pub struct CoverPayload {
     pub url: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistPayload {
+    pub name: String,
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub trans_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SongKind {
+    Song,
+    Podcast,
+    Local,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataPayload {
@@ -61,6 +80,38 @@ pub struct MetadataPayload {
     pub cover: Option<CoverPayload>,
     pub ncm_id: Option<u64>,
     pub duration: Option<f64>,
+
+    /// 结构化的艺术家列表, 为空时退回 `author_name`
+    #[serde(default)]
+    pub artists: Vec<ArtistPayload>,
+    #[serde(default)]
+    pub album_id: Option<u64>,
+    #[serde(default)]
+    pub trans_name: Option<String>,
+    /// 只有 `Song` 的 ID 才是曲库 ID, 播客和本地歌曲的 ID 不能用来拼链接
+    #[serde(default)]
+    pub kind: Option<SongKind>,
+}
+
+/// 当前音频流的真实规格, 缺失的字段一律不展示
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInfoPayload {
+    /// 这份规格属于哪首歌, 与当前元数据的 `ncm_id` 不一致时不展示
+    pub ncm_id: u64,
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// 单位 bit/s
+    #[serde(default)]
+    pub bitrate: Option<u32>,
+    /// 单位 Hz
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub bit_depth: Option<u8>,
+    /// 网易云实际下发的音质档位代码, 例如 "lossless"
+    #[serde(default)]
+    pub level: Option<String>,
 }
 
 /// 一次元数据更新命令
@@ -128,6 +179,39 @@ pub struct DiscordConfigPayload {
     pub display_mode: Option<DiscordDisplayMode>,
     #[serde(default)]
     pub app_name_mode: DiscordAppNameMode,
+    #[serde(default)]
+    pub third_line: DiscordThirdLine,
+    #[serde(default)]
+    pub artist_separator: DiscordArtistSeparator,
+    #[serde(default)]
+    pub show_translation: bool,
+    #[serde(default = "default_true")]
+    pub links: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordThirdLine {
+    #[default]
+    Album,
+    /// `Lossless`
+    Tier,
+    /// `Lossless · 专辑名`
+    TierAndAlbum,
+    /// `Lossless · FLAC 48 kHz, 1104 kbps`
+    Full,
+    /// `Lossless · FLAC 48k, 1104k`
+    Compact,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscordArtistSeparator {
+    #[default]
+    Comma,
+    Slash,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
@@ -135,6 +219,7 @@ pub struct DiscordConfigPayload {
 pub enum DiscordAppNameMode {
     #[default]
     Default,
+    DefaultEn,
     Song,
     Artist,
     Album,

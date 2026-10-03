@@ -19,6 +19,7 @@ import {
 	useNcmVersion,
 	useVersionWarning,
 } from "./hooks";
+import { useT } from "./i18n";
 import { NativeBackendInstance } from "./services/NativeBackend";
 import {
 	backendLogLevelAtom,
@@ -43,6 +44,7 @@ export default function App() {
 }
 
 function Main() {
+	const t = useT();
 	const ncmVersion = useNcmVersion();
 	const adapterState = useInfoProvider(ncmVersion);
 	const { adapter, status, error } = adapterState;
@@ -97,7 +99,7 @@ function Main() {
 
 	return (
 		<div className={styles.mainContainer}>
-			<h2 className={styles.pageTitle}>InfLink-rs 设置</h2>
+			<h2 className={styles.pageTitle}>{t.pageTitle}</h2>
 
 			<VersionWarningAlert version={ncmVersion} show={showVersionWarning} />
 

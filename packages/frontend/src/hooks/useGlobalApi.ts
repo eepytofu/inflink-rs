@@ -14,6 +14,7 @@ export function useGlobalApi(adapter: INcmAdapter | null) {
 				getTimeline: () => adapter.getTimelineInfo(),
 				getPlayMode: () => adapter.getPlayMode(),
 				getVolume: () => adapter.getVolumeInfo(),
+				getCurrentAudioInfo: () => adapter.getCurrentAudioInfo(),
 
 				play: () => handleAdapterCommand(adapter, { type: "Play" }),
 				pause: () => handleAdapterCommand(adapter, { type: "Pause" }),

@@ -1,4 +1,5 @@
 import type {
+	AudioInfo,
 	PlaybackEventMap,
 	PlaybackStatus,
 	PlayMode,
@@ -17,6 +18,7 @@ export interface INcmAdapter extends TypedEventTarget<PlaybackEventMap> {
 	getTimelineInfo(): TimelineInfo | null;
 	getPlayMode(): PlayMode;
 	getVolumeInfo(): VolumeInfo;
+	getCurrentAudioInfo(): AudioInfo | null;
 
 	hasNativeSmtcSupport(): boolean;
 	setInternalLogging(enabled: boolean): void;

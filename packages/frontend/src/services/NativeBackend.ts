@@ -1,4 +1,9 @@
-import type { PlaybackStatus, RepeatMode, SongInfo } from "@/types/api";
+import type {
+	AudioInfo,
+	PlaybackStatus,
+	RepeatMode,
+	SongInfo,
+} from "@/types/api";
 import type {
 	AppMessage,
 	CommandResult,
@@ -294,7 +299,23 @@ class NativeBackend {
 			cover: cover?.url ? cover : null,
 			ncmId: songInfo.ncmId,
 			duration: songInfo.duration,
+			artists: songInfo.artists,
+			albumId: songInfo.albumId,
+			transName: songInfo.transName,
+			kind: songInfo.type,
 		};
+	}
+
+	public updateAudioInfo(info: AudioInfo) {
+		if (!this.isActive) return;
+		this.dispatch("UpdateAudioInfo", {
+			ncmId: info.ncmId,
+			codec: info.codec,
+			bitrate: info.bitrate,
+			sampleRate: info.sampleRate,
+			bitDepth: info.bitDepth,
+			level: info.level,
+		});
 	}
 
 	public updatePlayState(status: PlaybackStatus) {

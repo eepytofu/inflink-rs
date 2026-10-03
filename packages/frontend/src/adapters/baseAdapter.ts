@@ -1,6 +1,7 @@
 import type { INcmAdapter } from "@/adapters/adapter";
 import { PlayModeController } from "@/adapters/playModeController";
 import type {
+	AudioInfo,
 	PlaybackEventMap,
 	PlaybackStatus,
 	PlayMode,
@@ -32,6 +33,7 @@ export abstract class BaseNcmAdapter
 	protected volume = 1.0;
 	protected isMuted = false;
 	protected resolutionSetting = "500";
+	protected audioInfo: AudioInfo | null = null;
 
 	protected readonly coverManager = new CoverManager();
 	protected readonly playModeController = new PlayModeController();
@@ -90,6 +92,16 @@ export abstract class BaseNcmAdapter
 
 	public getVolumeInfo(): VolumeInfo {
 		return { volume: this.volume, isMuted: this.isMuted };
+	}
+
+	public getCurrentAudioInfo(): AudioInfo | null {
+		return this.audioInfo;
+	}
+
+	protected updateAudioInfo(info: AudioInfo | null): void {
+		if (JSON.stringify(info) === JSON.stringify(this.audioInfo)) return;
+		this.audioInfo = info;
+		this.dispatch("audioInfoChange", info);
 	}
 
 	public setResolution(resolution: string): void {

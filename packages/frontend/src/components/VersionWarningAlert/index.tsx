@@ -2,6 +2,7 @@ import { useAtom } from "jotai";
 import { ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { NcmVersionInfo } from "@/hooks";
+import { useT } from "@/i18n";
 import { ignoredVersionAtom } from "@/store";
 import { Alert } from "../Alert";
 import { AnimatedLink } from "../AnimatedLink";
@@ -16,6 +17,7 @@ export function VersionWarningAlert({
 	version,
 	show,
 }: VersionWarningAlertProps) {
+	const t = useT();
 	const [ignoredVersion, setIgnoredVersion] = useAtom(ignoredVersionAtom);
 	const [open, setOpen] = useState(false);
 
@@ -40,11 +42,10 @@ export function VersionWarningAlert({
 		<Collapse in={open} style={{ marginBottom: open ? "1rem" : 0 }}>
 			<Alert
 				severity="warning"
-				title="InfLink-rs 可能无法在当前的网易云音乐版本上运行"
+				title={t.versionWarningTitle}
 				onClose={handleClose}
 			>
-				InfLink-rs 未在此版本 ({version.raw})
-				上进行过测试，可能会导致功能异常或不稳定
+				{t.versionWarningBody(version.raw)}
 				<br />
 				<br />
 				<AnimatedLink
@@ -55,7 +56,7 @@ export function VersionWarningAlert({
 					}}
 					icon={<ExternalLink size={14} strokeWidth={2.5} />}
 				>
-					访问 GitHub 仓库以了解更多信息
+					{t.versionWarningLink}
 				</AnimatedLink>
 			</Alert>
 		</Collapse>

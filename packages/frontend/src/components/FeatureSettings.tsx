@@ -6,29 +6,46 @@
 import { useAtom } from "jotai";
 import {
 	AudioLines,
+	AudioWaveform,
 	Bug,
 	Database,
 	Edit,
 	ExternalLink,
+	Globe,
 	Headset,
+	Languages,
+	Link,
 	MonitorPlay,
 	Palette,
 	PauseCircle,
 	Terminal,
+	Users,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { DiscordDisplayMode } from "@/types/backend";
+import type {
+	DiscordAppNameModeType,
+	DiscordArtistSeparator,
+	DiscordDisplayMode,
+	DiscordThirdLine,
+} from "@/types/backend";
+import { LANGUAGE_OPTIONS, type Language, useT } from "../i18n";
 import {
 	backendLogLevelAtom,
 	discordAppNameModeTypeAtom,
+	discordArtistSeparatorAtom,
 	discordCustomAppNameTextAtom,
 	discordDisplayModeAtom,
 	discordEnabledAtom,
+	discordLinksAtom,
 	discordShowPausedAtom,
+	discordShowTranslationAtom,
+	discordThirdLineAtom,
 	frontendLogLevelAtom,
 	internalLoggingAtom,
+	languageAtom,
 	resolutionAtom,
 	smtcEnabledAtom,
+	toThirdLine,
 } from "../store";
 import type { LogLevel } from "../utils/logger";
 import { AnimatedLink } from "./AnimatedLink";
@@ -39,6 +56,9 @@ import { SettingItem } from "./SettingItem";
 import { Switch } from "./Switch";
 
 export function FeatureSettings() {
+	const t = useT();
+	const [language, setLanguage] = useAtom(languageAtom);
+
 	const [smtcEnabled, setSmtcEnabled] = useAtom(smtcEnabledAtom);
 	const [resolution, setResolution] = useAtom(resolutionAtom);
 	const [localResolution, setLocalResolution] = useState(resolution);
@@ -56,6 +76,14 @@ export function FeatureSettings() {
 	const [customAppNameText, setCustomAppNameText] = useAtom(
 		discordCustomAppNameTextAtom,
 	);
+	const [thirdLine, setThirdLine] = useAtom(discordThirdLineAtom);
+	const [artistSeparator, setArtistSeparator] = useAtom(
+		discordArtistSeparatorAtom,
+	);
+	const [showTranslation, setShowTranslation] = useAtom(
+		discordShowTranslationAtom,
+	);
+	const [links, setLinks] = useAtom(discordLinksAtom);
 
 	const [localCustomText, setLocalCustomText] = useState(customAppNameText);
 
@@ -111,37 +139,66 @@ export function FeatureSettings() {
 	];
 
 	const displayModeOptions = [
-		{ label: "应用名称", value: "Name" },
-		{ label: "歌手名", value: "State" },
-		{ label: "歌曲名", value: "Details" },
+		{ label: t.optAppName, value: "Name" },
+		{ label: t.optArtist, value: "State" },
+		{ label: t.optSong, value: "Details" },
 	];
 
 	const appNameModeOptions = [
-		{ label: "应用名称", value: "Default" },
-		{ label: "歌曲名", value: "Song" },
-		{ label: "歌手名", value: "Artist" },
-		{ label: "专辑名", value: "Album" },
-		{ label: "自定义文本", value: "Custom" },
+		{ label: t.optAppName, value: "Default" },
+		{ label: t.optAppNameEn, value: "DefaultEn" },
+		{ label: t.optSong, value: "Song" },
+		{ label: t.optArtist, value: "Artist" },
+		{ label: t.optAlbum, value: "Album" },
+		{ label: t.optCustom, value: "Custom" },
+	];
+
+	// 直接拿实际效果当选项名，比起名字更一目了然
+	const thirdLineOptions = [
+		{ label: t.optAlbum, value: "Album" },
+		{ label: "Lossless", value: "Tier" },
+		{ label: `Lossless · ${t.optAlbum}`, value: "TierAndAlbum" },
+		{ label: "Lossless · FLAC 48 kHz, 1104 kbps", value: "Full" },
+		{ label: "Lossless · FLAC 48k, 1104k", value: "Compact" },
+	];
+
+	const artistSeparatorOptions = [
+		{ label: t.optComma, value: "Comma" },
+		{ label: t.optSlash, value: "Slash" },
 	];
 
 	return (
 		<div className={styles.sectionContainerSmall}>
-			<h3 className={styles.sectionTitle}>SMTC 设置</h3>
+			<SettingItem
+				icon={<Globe size={20} />}
+				// 两种语言都写上，看不懂当前语言的人也能找到这一行
+				title="语言 / Language"
+				action={
+					<Combobox
+						options={LANGUAGE_OPTIONS}
+						value={language}
+						onChange={(val) => setLanguage(val as Language)}
+						editable={false}
+					/>
+				}
+			/>
+
+			<h3 className={`${styles.sectionTitle} ${styles.sectionContainer}`}>
+				{t.smtcSection}
+			</h3>
 
 			<SettingItem
 				icon={<AudioLines size={20} />}
-				title="启用 SMTC 集成"
+				title={t.smtcEnable}
 				description={
 					<span>
 						<AnimatedLink
 							onClick={() => {
-								betterncm.ncm.openUrl(
-									"https://learn.microsoft.com/zh-cn/windows/uwp/audio-video-camera/integrate-with-systemmediatransportcontrols",
-								);
+								betterncm.ncm.openUrl(t.smtcDocsUrl);
 							}}
 							icon={<ExternalLink size={14} strokeWidth={2.5} />}
 						>
-							在微软文档中查看
+							{t.smtcDocsLink}
 						</AnimatedLink>
 					</span>
 				}
@@ -156,8 +213,8 @@ export function FeatureSettings() {
 			<SettingItem
 				visible={smtcEnabled}
 				icon={<MonitorPlay size={20} />}
-				title="封面分辨率"
-				description="较高的分辨率可能会降低信息更新速度"
+				title={t.coverResolution}
+				description={t.coverResolutionDesc}
 				action={
 					<Combobox
 						options={resolutionOptions}
@@ -170,13 +227,13 @@ export function FeatureSettings() {
 			/>
 
 			<h3 className={`${styles.sectionTitle} ${styles.sectionContainer}`}>
-				Discord Rich Presence 设置
+				{t.discordSection}
 			</h3>
 
 			<SettingItem
 				icon={<Headset size={20} />}
-				title="启用 Discord RPC 集成"
-				description="将当前播放的歌曲同步显示到 Discord 状态中"
+				title={t.discordEnable}
+				description={t.discordEnableDesc}
 				action={
 					<Switch
 						checked={discordEnabled}
@@ -188,12 +245,12 @@ export function FeatureSettings() {
 			<SettingItem
 				visible={discordEnabled}
 				icon={<PauseCircle size={20} />}
-				title="暂停时显示状态"
+				title={t.showPaused}
 				description={
 					<span>
-						暂停时保留 Discord 状态的显示
+						{t.showPausedDesc}
 						<br />
-						注：由于 Discord 的限制，已播放时间将变为 00:00
+						{t.showPausedNote}
 					</span>
 				}
 				action={
@@ -207,8 +264,8 @@ export function FeatureSettings() {
 			<SettingItem
 				visible={discordEnabled}
 				icon={<Palette size={20} />}
-				title="简略信息"
-				description="向其他人展示的简略信息"
+				title={t.displayMode}
+				description={t.displayModeDesc}
 				action={
 					<Combobox
 						options={displayModeOptions}
@@ -222,12 +279,12 @@ export function FeatureSettings() {
 			<SettingItem
 				visible={discordEnabled}
 				icon={<Edit size={20} />}
-				title="自定义应用名称"
+				title={t.appName}
 				description={
 					<span>
-						会显示在 “Listening to” 后面
+						{t.appNameDesc}
 						<br />
-						如果在 “简略信息” 设置中选择了 “应用名称”，简略信息也会显示此名称
+						{t.appNameNote}
 					</span>
 				}
 				action={
@@ -236,16 +293,14 @@ export function FeatureSettings() {
 							options={appNameModeOptions}
 							value={appNameModeType}
 							onChange={(val) =>
-								setAppNameModeType(
-									val as "Default" | "Song" | "Artist" | "Album" | "Custom",
-								)
+								setAppNameModeType(val as DiscordAppNameModeType)
 							}
 							editable={false}
 						/>
 						{appNameModeType === "Custom" && (
 							<Input
 								style={{ width: 140 }}
-								placeholder="自定义名称..."
+								placeholder={t.customNamePlaceholder}
 								value={localCustomText}
 								onChange={(e) => setLocalCustomText(e.target.value)}
 								onBlur={handleCustomTextCommit}
@@ -256,11 +311,69 @@ export function FeatureSettings() {
 				}
 			/>
 
-			<h3 className={styles.sectionTitle}>高级选项</h3>
+			<SettingItem
+				visible={discordEnabled}
+				icon={<AudioWaveform size={20} />}
+				title={t.thirdLine}
+				description={t.thirdLineDesc}
+				action={
+					<Combobox
+						options={thirdLineOptions}
+						value={toThirdLine(thirdLine)}
+						onChange={(val) => setThirdLine(val as DiscordThirdLine)}
+						editable={false}
+					/>
+				}
+			/>
+
+			<SettingItem
+				visible={discordEnabled}
+				icon={<Users size={20} />}
+				title={t.artistSeparator}
+				description={t.artistSeparatorDesc}
+				action={
+					<Combobox
+						options={artistSeparatorOptions}
+						value={artistSeparator}
+						onChange={(val) =>
+							setArtistSeparator(val as DiscordArtistSeparator)
+						}
+						editable={false}
+					/>
+				}
+			/>
+
+			<SettingItem
+				visible={discordEnabled}
+				icon={<Languages size={20} />}
+				title={t.showTranslation}
+				description={t.showTranslationDesc}
+				action={
+					<Switch
+						checked={showTranslation}
+						onChange={(_e, checked) => setShowTranslation(checked)}
+					/>
+				}
+			/>
+
+			<SettingItem
+				visible={discordEnabled}
+				icon={<Link size={20} />}
+				title={t.links}
+				description={t.linksDesc}
+				action={
+					<Switch
+						checked={links}
+						onChange={(_e, checked) => setLinks(checked)}
+					/>
+				}
+			/>
+
+			<h3 className={styles.sectionTitle}>{t.advancedSection}</h3>
 
 			<SettingItem
 				icon={<Terminal size={20} />}
-				title="前端日志级别"
+				title={t.frontendLogLevel}
 				action={
 					<Combobox
 						options={logLevelOptions}
@@ -273,7 +386,7 @@ export function FeatureSettings() {
 
 			<SettingItem
 				icon={<Database size={20} />}
-				title="后端日志级别"
+				title={t.backendLogLevel}
 				action={
 					<Combobox
 						options={logLevelOptions}
@@ -287,8 +400,8 @@ export function FeatureSettings() {
 			{import.meta.env.DEV ? (
 				<SettingItem
 					icon={<Bug size={20} />}
-					title="内部日志转发"
-					description="仅供调试"
+					title={t.internalLogging}
+					description={t.internalLoggingDesc}
 					action={
 						<Switch
 							checked={internalLogging}

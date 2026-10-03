@@ -12,15 +12,82 @@ export interface CoverInfo {
 	url?: string | undefined;
 }
 
+/**
+ * @since 插件版本 3.4.0
+ */
+export interface ArtistInfo {
+	name: string;
+	/** 网易云的艺术家 ID。本地歌曲、播客等没有曲库 ID 的情况下不存在 */
+	id?: number | undefined;
+	/** 网易云提供的译名，没有时不存在 */
+	transName?: string | undefined;
+}
+
+/**
+ * - `song`: 曲库里的歌曲，`ncmId` 是歌曲 ID
+ * - `podcast`: 播客节目，`ncmId` 是节目 ID
+ * - `local`: 没有匹配到曲库的本地文件，`ncmId` 为 0
+ * @since 插件版本 3.4.0
+ */
+export type SongType = "song" | "podcast" | "local";
+
 export interface SongInfo {
 	songName: string;
 	albumName: string;
+	/** 所有艺术家的名字，以 " / " 连接 */
 	authorName: string;
 	cover: CoverInfo | null;
 	/** 歌曲ID */
 	ncmId: number;
 	/** 单位毫秒 */
 	duration?: number | undefined;
+
+	/**
+	 * 结构化的艺术家列表，顺序与网易云一致
+	 * @since 插件版本 3.4.0
+	 */
+	artists?: ArtistInfo[] | undefined;
+	/**
+	 * 网易云的专辑 ID
+	 * @since 插件版本 3.4.0
+	 */
+	albumId?: number | undefined;
+	/**
+	 * 网易云提供的歌名译名
+	 * @since 插件版本 3.4.0
+	 */
+	transName?: string | undefined;
+	/**
+	 * 歌曲别名（副标题），例如 "电视剧《xxx》片尾曲"
+	 * @since 插件版本 3.4.0
+	 */
+	alias?: string[] | undefined;
+	/**
+	 * @since 插件版本 3.4.0
+	 */
+	type?: SongType | undefined;
+}
+
+/**
+ * 当前音频流的真实规格
+ *
+ * 所有字段都来自网易云实际下发的音频流信息，拿不到的字段不存在，
+ * 不会用音质档位的宣传参数去填充
+ * @since 插件版本 3.4.0
+ */
+export interface AudioInfo {
+	/** 这份规格对应的歌曲 ID，与 `SongInfo.ncmId` 一致 */
+	ncmId: number;
+	/** 编码格式，小写，例如 "flac"、"mp3" */
+	codec?: string | undefined;
+	/** 实际平均码率，单位 bit/s */
+	bitrate?: number | undefined;
+	/** 采样率，单位 Hz */
+	sampleRate?: number | undefined;
+	/** 位深 */
+	bitDepth?: number | undefined;
+	/** 网易云实际下发的音质档位，例如 "lossless"、"hires" */
+	level?: string | undefined;
 }
 
 export interface TimelineInfo {
@@ -71,6 +138,14 @@ export interface PlaybackEventMap {
 	volumeChange: CustomEvent<VolumeInfo>;
 
 	/**
+	 * 当前音频流的规格发生变化，切歌或在同一首歌内切换音质时触发
+	 *
+	 * 规格可能晚于 `songChange` 到达。拿不到规格时为 `null`
+	 * @since 插件版本 3.4.0
+	 */
+	audioInfoChange: CustomEvent<AudioInfo | null>;
+
+	/**
 	 * C++ 后端抛出的音频数据
 	 *
 	 * 注意监听此事件可能会对性能有一定影响
@@ -94,6 +169,11 @@ export interface IInfLinkApi {
 	getTimeline(): TimelineInfo | null;
 	getPlayMode(): PlayMode;
 	getVolume(): VolumeInfo;
+	/**
+	 * 获取当前歌曲的音频流规格，拿不到时返回 `null`
+	 * @since 插件版本 3.4.0
+	 */
+	getCurrentAudioInfo(): AudioInfo | null;
 
 	play(): void;
 	pause(): void;

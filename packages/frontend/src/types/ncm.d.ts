@@ -3,8 +3,10 @@ import type { AudioDataInfo } from "./api";
 
 // --- 通用类型 ---
 export interface Artist {
-	id: string | undefined | null;
+	id: string | number | undefined | null;
 	name: string;
+	trans?: string | null;
+	transName?: string | null;
 }
 
 export interface AudioLoadInfo {
@@ -67,14 +69,39 @@ export namespace v3 {
 		duration?: number;
 		album?: TrackAlbum;
 		artists?: Artist[];
+		alias?: string[] | null;
+		transNames?: string[] | null;
+	}
+
+	/**
+	 * 网易云请求播放地址后留在内存里的音频流信息
+	 *
+	 * 从磁盘缓存恢复出来的条目字段更少，例如没有 `sr`
+	 */
+	export interface StreamInfo {
+		id?: string | number | null;
+		/** 编码格式，例如 "flac" */
+		type?: string | null;
+		/** 实际平均码率 (bit/s)，不是音质档位 */
+		br?: number | null;
+		/** 采样率 (Hz) */
+		sr?: number | null;
+		/** 实际下发的音质档位，可能低于请求的档位 */
+		level?: string | null;
+		md5?: string | null;
+		url?: string | null;
 	}
 
 	export interface PlayingInfo {
+		/** 每次加载音频都会变，形如 `${songId}_${随机后缀}` */
+		playId?: string;
+		/** 音质档位代码，例如 999、1999，不是码率 */
+		resourcePlayingQuality?: number;
 		resourceTrackId?: string;
 		resourceName?: string;
 		resourceArtists?: Artist[];
 		resourceCoverUrl?: string;
-		resourceType?: "song" | "voice" | "localTrack";
+		resourceType?: "track" | "song" | "voice" | "localTrack" | string;
 		curTrack?: CurTrack | null;
 		playingState?: PlayState;
 		playingMode?: PlayMode;

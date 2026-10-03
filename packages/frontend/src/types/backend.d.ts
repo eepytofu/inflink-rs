@@ -1,4 +1,10 @@
-import type { PlaybackStatus, PlayMode, RepeatMode, VolumeInfo } from "./api";
+import type {
+	PlaybackStatus,
+	PlayMode,
+	RepeatMode,
+	SongType,
+	VolumeInfo,
+} from "./api";
 
 export type ControlMessage =
 	| { type: "Play" }
@@ -33,6 +39,25 @@ export interface MetadataPayload {
 	cover: MetadataCoverPayload | null;
 	ncmId: number;
 	duration?: number | undefined;
+	artists?: MetadataArtistPayload[] | undefined;
+	albumId?: number | undefined;
+	transName?: string | undefined;
+	kind?: SongType | undefined;
+}
+
+export interface MetadataArtistPayload {
+	name: string;
+	id?: number | undefined;
+	transName?: string | undefined;
+}
+
+export interface AudioInfoPayload {
+	ncmId: number;
+	codec?: string | undefined;
+	bitrate?: number | undefined;
+	sampleRate?: number | undefined;
+	bitDepth?: number | undefined;
+	level?: string | undefined;
 }
 
 export interface MetadataCoverPayload {
@@ -52,6 +77,7 @@ export interface VolumePayload extends VolumeInfo {}
 
 export type AppMessage = {
 	UpdateMetadata: MetadataPayload;
+	UpdateAudioInfo: AudioInfoPayload;
 	UpdatePlayState: PlayStatePayload;
 	UpdateTimeline: TimelinePayload;
 	UpdatePlayMode: PlayModePayload;
@@ -66,14 +92,35 @@ export type AppMessage = {
 
 export type DiscordDisplayMode = "Name" | "State" | "Details";
 
+export type DiscordThirdLine =
+	| "Album"
+	| "Tier"
+	| "TierAndAlbum"
+	| "Full"
+	| "Compact";
+export type DiscordArtistSeparator = "Comma" | "Slash";
+
 export interface DiscordConfigPayload {
 	showWhenPaused: boolean;
 	displayMode: DiscordDisplayMode;
 	appNameMode: DiscordAppNameMode;
+	thirdLine: DiscordThirdLine;
+	artistSeparator: DiscordArtistSeparator;
+	showTranslation: boolean;
+	links: boolean;
 }
+
+export type DiscordAppNameModeType =
+	| "Default"
+	| "DefaultEn"
+	| "Song"
+	| "Artist"
+	| "Album"
+	| "Custom";
 
 export type DiscordAppNameMode =
 	| { type: "Default" }
+	| { type: "DefaultEn" }
 	| { type: "Song" }
 	| { type: "Artist" }
 	| { type: "Album" }

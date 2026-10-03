@@ -1,5 +1,6 @@
 import { AlertCircle, AlertTriangle, X } from "lucide-react";
 import type { ReactNode } from "react";
+import { useT } from "@/i18n";
 import styles from "./index.module.css";
 
 export interface AlertProps {
@@ -17,6 +18,7 @@ export function Alert({
 	onClose,
 	className = "",
 }: AlertProps) {
+	const t = useT();
 	const isError = severity === "error";
 	const alertClass = isError ? styles.error : styles.warning;
 	const DefaultIcon = isError ? AlertCircle : AlertTriangle;
@@ -35,7 +37,7 @@ export function Alert({
 					type="button"
 					className={styles.closeButton}
 					onClick={onClose}
-					title="关闭"
+					title={t.close}
 				>
 					<X size={18} strokeWidth={2.5} />
 				</button>

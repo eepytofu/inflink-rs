@@ -17,6 +17,10 @@ export function useBackendConnection(adapterState: AdapterState) {
 		discordShowPaused,
 		discordDisplayMode,
 		appNameMode,
+		discordThirdLine,
+		discordArtistSeparator,
+		discordShowTranslation,
+		discordLinks,
 	} = config;
 
 	const hasSentInitialMetadata = useRef(false);
@@ -53,6 +57,10 @@ export function useBackendConnection(adapterState: AdapterState) {
 			nativeBackend.updateTimeline(e.detail);
 		const onPlayModeChange = (e: PlaybackEventMap["playModeChange"]) =>
 			nativeBackend.updatePlayMode(e.detail);
+		const onAudioInfoChange = (e: PlaybackEventMap["audioInfoChange"]) => {
+			// 没有规格时不用通知后端，后端只采用与当前歌曲 ID 相符的规格
+			if (e.detail) nativeBackend.updateAudioInfo(e.detail);
+		};
 
 		const onControl = (msg: ControlMessage) => {
 			handleAdapterCommand(adapter, msg);
@@ -62,10 +70,18 @@ export function useBackendConnection(adapterState: AdapterState) {
 		adapter.addEventListener("playStateChange", onPlayStateChange);
 		adapter.addEventListener("timelineUpdate", onTimelineUpdate);
 		adapter.addEventListener("playModeChange", onPlayModeChange);
+		adapter.addEventListener("audioInfoChange", onAudioInfoChange);
 
 		nativeBackend.initialize(onControl);
 
+		// 规格通常在后端连接之前就读到了
+		const currentAudioInfo = adapter.getCurrentAudioInfo();
+		if (currentAudioInfo) {
+			nativeBackend.updateAudioInfo(currentAudioInfo);
+		}
+
 		return () => {
+			adapter.removeEventListener("audioInfoChange", onAudioInfoChange);
 			adapter.removeEventListener("songChange", onSongChange);
 			adapter.removeEventListener("playStateChange", onPlayStateChange);
 			adapter.removeEventListener("timelineUpdate", onTimelineUpdate);
@@ -96,6 +112,10 @@ export function useBackendConnection(adapterState: AdapterState) {
 			showWhenPaused: discordShowPaused,
 			displayMode: discordDisplayMode,
 			appNameMode: appNameMode,
+			thirdLine: discordThirdLine,
+			artistSeparator: discordArtistSeparator,
+			showTranslation: discordShowTranslation,
+			links: discordLinks,
 		});
 	}, [
 		shouldConnect,
@@ -104,5 +124,9 @@ export function useBackendConnection(adapterState: AdapterState) {
 		discordShowPaused,
 		discordDisplayMode,
 		appNameMode,
+		discordThirdLine,
+		discordArtistSeparator,
+		discordShowTranslation,
+		discordLinks,
 	]);
 }

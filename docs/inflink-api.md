@@ -87,6 +87,40 @@ api.removeEventListener("timelineUpdate", onTimelineUpdate);
 | `ncmId`      | `number`              | 网易云歌曲 ID                          |
 | `duration`   | `number \| undefined` | 歌曲时长，单位毫秒                     |
 
+以下字段自插件版本 `3.4.0` 起提供，全部可选，读取前请判空：
+
+| 字段        | 类型                        | 说明                                                             |
+| ----------- | --------------------------- | ---------------------------------------------------------------- |
+| `artists`   | `ArtistInfo[] \| undefined` | 结构化的艺术家列表，每项包含 `name`，以及可选的 `id`、`transName` |
+| `albumId`   | `number \| undefined`       | 网易云专辑 ID                                                    |
+| `transName` | `string \| undefined`       | 网易云提供的歌名译名                                             |
+| `alias`     | `string[] \| undefined`     | 歌曲别名（副标题）                                               |
+| `type`      | `"song" \| "podcast" \| "local" \| undefined` | 只有 `song` 的 `ncmId` 是曲库里的歌曲 ID       |
+
+本地歌曲、播客没有曲库 ID，此时 `artists[].id` 和 `albumId` 不存在。
+
+### `getCurrentAudioInfo(): AudioInfo | null`
+
+> [!IMPORTANT]
+> 自插件版本 3.4.0 后可用，目前只有网易云 v3 客户端能读到
+
+返回当前歌曲音频流的真实规格；读不到时返回 `null`。
+
+| 字段         | 类型                  | 说明                                             |
+| ------------ | --------------------- | ------------------------------------------------ |
+| `ncmId`      | `number`              | 这份规格对应的歌曲 ID，与 `SongInfo.ncmId` 一致  |
+| `codec`      | `string \| undefined` | 编码格式，小写，例如 `flac`、`mp3`               |
+| `bitrate`    | `number \| undefined` | 实际平均码率，单位 bit/s                         |
+| `sampleRate` | `number \| undefined` | 采样率，单位 Hz                                  |
+| `bitDepth`   | `number \| undefined` | 位深                                             |
+| `level`      | `string \| undefined` | 网易云实际下发的音质档位，例如 `lossless`、`hires` |
+
+这些值来自网易云实际下发的音频流信息，而不是音质档位的宣传参数，所以拿不到的字段不会出现：
+
+- 网易云不提供位深，`bitDepth` 目前始终不存在。
+- 从磁盘缓存恢复的歌曲没有 `sampleRate`。
+- `level` 是实际下发的档位，可能低于用户选择的档位。
+
 ### `getTimeline(): TimelineInfo | null`
 
 返回当前播放进度，字段如下：
@@ -147,6 +181,7 @@ api.removeEventListener("timelineUpdate", onTimelineUpdate);
 | `playModeChange`    | `PlayMode`              | 随机播放或循环模式变化          |
 | `volumeChange`      | `VolumeInfo`            | 音量或静音状态变化              |
 | `audioDataUpdate`   | `AudioDataInfo`         | 后端抛出的 PCM 音频数据         |
+| `audioInfoChange`   | `AudioInfo \| null`     | 音频流规格变化，切歌或切换音质时触发，可能晚于 `songChange` |
 
 ### 事件示例
 

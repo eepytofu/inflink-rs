@@ -4,24 +4,27 @@
  */
 
 import { Loader2 } from "lucide-react";
+import { useT } from "../i18n";
 import { Alert } from "./Alert";
 import styles from "./StatusComponents.module.css";
 
 export function LoadingIndicator() {
+	const t = useT();
 	return (
 		<div className={styles.loadingContainer}>
 			<Loader2 className={styles.spinner} size={24} />
-			<span className={styles.loadingText}>正在初始化...</span>
+			<span className={styles.loadingText}>{t.loading}</span>
 		</div>
 	);
 }
 
 export function InitializationErrorAlert({ error }: { error: Error | null }) {
+	const t = useT();
 	return (
-		<Alert severity="error" title="插件初始化失败">
-			部分组件未能初始化, 请尝试重启网易云音乐, 或者打开控制台查看详细信息
+		<Alert severity="error" title={t.initFailedTitle}>
+			{t.initFailedBody}
 			<br />
-			错误信息: {error?.message || "未知错误"}
+			{t.errorMessage}: {error?.message || t.unknownError}
 		</Alert>
 	);
 }
