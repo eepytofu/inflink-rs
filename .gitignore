@@ -4,3 +4,8 @@ node_modules
 **/dist/
 **/tsconfig.tsbuildinfo
 .env
+
+# 本地的私有笔记和 AI 助手的工作文件
+.agents/
+.claude/
+*.local.md
