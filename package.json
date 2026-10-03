@@ -12,6 +12,7 @@
 		"build": "cd packages/frontend && vite build",
 		"dev": "cd packages/frontend && vite build --watch --mode development",
 		"build:frontend": "cd packages/frontend && vite build --mode frontend-only",
+		"dev-install": "node ./scripts/dev-install.ts",
 		"lint": "biome check . --error-on-warnings",
 		"format": "biome format . --write",
 		"typecheck": "tsc -b && tsc -p scripts/tsconfig.json",
