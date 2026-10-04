@@ -6,8 +6,6 @@
 
 sorry for the english, 我的中文不好.
 
-<img src="./assets/discord-card.avif" width="296" alt="discord card showing FLAC 24-bit/48 kHz and the album on the third line">
-
 * song, artist and cover on the discord card are clickable
 * artists can be joined with a comma (default) or a slash
 * third line can be the album (default), the quality netease actually delivered (e.g. `24-bit/48 kHz FLAC`, `256 kbps AAC`), or both
