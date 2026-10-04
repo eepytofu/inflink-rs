@@ -19,7 +19,12 @@ export interface ArtistInfo {
 	name: string;
 	/** 网易云的艺术家 ID。本地歌曲、播客等没有曲库 ID 的情况下不存在 */
 	id?: number | undefined;
-	/** 网易云提供的译名，没有时不存在 */
+	/**
+	 * 网易云提供的译名，没有时不存在
+	 *
+	 * In practice always missing on the v3 client: the player's artist objects
+	 * come with the translation blanked, it only exists on the artist page
+	 */
 	transName?: string | undefined;
 }
 
@@ -57,6 +62,11 @@ export interface SongInfo {
 	 * @since 插件版本 3.4.0
 	 */
 	transName?: string | undefined;
+	/**
+	 * NetEase's translated album name
+	 * @since 插件版本 3.4.0
+	 */
+	albumTransName?: string | undefined;
 	/**
 	 * 歌曲别名（副标题），例如 "电视剧《xxx》片尾曲"
 	 * @since 插件版本 3.4.0

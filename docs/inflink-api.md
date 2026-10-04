@@ -94,6 +94,7 @@ api.removeEventListener("timelineUpdate", onTimelineUpdate);
 | `artists`   | `ArtistInfo[] \| undefined` | 结构化的艺术家列表，每项包含 `name`，以及可选的 `id`、`transName` |
 | `albumId`   | `number \| undefined`       | 网易云专辑 ID                                                    |
 | `transName` | `string \| undefined`       | 网易云提供的歌名译名                                             |
+| `albumTransName` | `string \| undefined`  | 网易云提供的专辑译名                                             |
 | `alias`     | `string[] \| undefined`     | 歌曲别名（副标题）                                               |
 | `type`      | `"song" \| "podcast" \| "local" \| undefined` | 只有 `song` 的 `ncmId` 是曲库里的歌曲 ID       |
 

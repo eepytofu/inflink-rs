@@ -61,6 +61,7 @@ export namespace v3 {
 		name?: string;
 		albumName?: string;
 		picUrl?: string;
+		transNames?: string[] | null;
 	}
 
 	export interface CurTrack {

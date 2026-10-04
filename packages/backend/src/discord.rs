@@ -158,11 +158,7 @@ fn with_translation(name: &str, translation: Option<&str>, show: bool) -> String
     }
 }
 
-fn format_artists(
-    metadata: &MetadataPayload,
-    separator: DiscordArtistSeparator,
-    show_translation: bool,
-) -> String {
+fn format_artists(metadata: &MetadataPayload, separator: DiscordArtistSeparator) -> String {
     if metadata.artists.is_empty() {
         return metadata.author_name.clone();
     }
@@ -170,10 +166,11 @@ fn format_artists(
         DiscordArtistSeparator::Comma => ", ",
         DiscordArtistSeparator::Slash => " / ",
     };
+    // Artist names stay as NetEase lists them: the player never carries a translation for them
     metadata
         .artists
         .iter()
-        .map(|a| with_translation(&a.name, a.trans_name.as_deref(), show_translation))
+        .map(|a| a.name.as_str())
         .collect::<Vec<_>>()
         .join(separator)
 }
@@ -328,23 +325,28 @@ fn build_card_with(
     // 旧版前端不带 kind, 当时所有 ID 都被当成歌曲 ID
     let in_catalog = matches!(metadata.kind, None | Some(SongKind::Song));
     let waiting = audio.is_none() && audio_pending && in_catalog;
+    let album_name = with_translation(
+        &metadata.album_name,
+        metadata.album_trans_name.as_deref(),
+        options.show_translation,
+    );
     let album = || {
         if waiting {
             String::new()
         } else {
-            metadata.album_name.clone()
+            album_name.clone()
         }
     };
     // 确定读不到规格时 (v2 客户端、本地歌曲、播客) 一律退回专辑名
     let third_line = match options.third_line {
-        DiscordThirdLine::Album => metadata.album_name.clone(),
+        DiscordThirdLine::Album => album_name.clone(),
         // 音质放前面: 一行放不下时被截掉的是专辑名
         DiscordThirdLine::QualityAndAlbum => match audio.and_then(format_audio_compact) {
             Some(quality) if long_enough(&metadata.album_name) => {
-                format!("{quality} · {}", metadata.album_name)
+                format!("{quality} · {album_name}")
             }
             Some(quality) => quality,
-            None => metadata.album_name.clone(),
+            None => album_name.clone(),
         },
         DiscordThirdLine::Full => audio.and_then(format_audio_full).unwrap_or_else(album),
         DiscordThirdLine::Compact => audio.and_then(format_audio_compact).unwrap_or_else(album),
@@ -359,11 +361,7 @@ fn build_card_with(
             metadata.trans_name.as_deref(),
             options.show_translation,
         )),
-        state: clip(&format_artists(
-            metadata,
-            options.artist_separator,
-            options.show_translation,
-        )),
+        state: clip(&format_artists(metadata, options.artist_separator)),
         third_line: Some(clip(&third_line)).filter(|t| long_enough(t)),
         cover: process_cover_url(metadata.cover.as_ref().and_then(|c| c.url.as_deref())),
         song_url: link(catalog_url("song", metadata.ncm_id)),
@@ -1028,11 +1026,10 @@ mod tests {
         CoverPayload,
     };
 
-    fn artist(name: &str, id: Option<u64>, trans_name: Option<&str>) -> ArtistPayload {
+    fn artist(name: &str, id: Option<u64>) -> ArtistPayload {
         ArtistPayload {
             name: name.to_string(),
             id,
-            trans_name: trans_name.map(str::to_string),
         }
     }
 
@@ -1045,13 +1042,14 @@ mod tests {
             ncm_id: Some(3_348_915_450),
             duration: Some(258_586.0),
             artists: vec![
-                artist("哔哩哔哩拜年纪", Some(47_090_969), None),
-                artist("洛天依Official", Some(906_118), None),
-                artist("乐正绫", Some(1_102_240), None),
-                artist("裘丹莉", Some(52_437_191), None),
+                artist("哔哩哔哩拜年纪", Some(47_090_969)),
+                artist("洛天依Official", Some(906_118)),
+                artist("乐正绫", Some(1_102_240)),
+                artist("裘丹莉", Some(52_437_191)),
             ],
             album_id: Some(361_770_580),
             trans_name: None,
+            album_trans_name: None,
             kind: Some(SongKind::Song),
         }
     }
@@ -1355,15 +1353,14 @@ mod tests {
         let mut meta = metadata();
         meta.song_name = "石火".to_string();
         meta.trans_name = Some("Stonefire".to_string());
-        meta.artists = vec![
-            artist("澤野弘之", Some(1), Some("Hiroyuki Sawano")),
-            artist("Aimer", Some(2), Some("Aimer")),
-            artist("mizuki", Some(3), Some("  ")),
-        ];
+        meta.album_name = "聖槍爆裂ボーイ".to_string();
+        meta.album_trans_name = Some("圣枪爆裂男孩".to_string());
+        meta.artists = vec![artist("澤野弘之", Some(1)), artist("Aimer", Some(2))];
 
         let card = build_card(&meta, None, &CardOptions::default());
         assert_eq!(card.details, "石火");
-        assert_eq!(card.state, "澤野弘之, Aimer, mizuki");
+        assert_eq!(card.state, "澤野弘之, Aimer");
+        assert_eq!(card.third_line.as_deref(), Some("聖槍爆裂ボーイ"));
 
         let shown = CardOptions {
             show_translation: true,
@@ -1371,7 +1368,18 @@ mod tests {
         };
         let card = build_card(&meta, None, &shown);
         assert_eq!(card.details, "石火 (Stonefire)");
-        assert_eq!(card.state, "澤野弘之 (Hiroyuki Sawano), Aimer, mizuki");
+        assert_eq!(card.state, "澤野弘之, Aimer");
+        assert_eq!(
+            card.third_line.as_deref(),
+            Some("聖槍爆裂ボーイ (圣枪爆裂男孩)")
+        );
+
+        // A translation equal to the name, or blank, adds nothing
+        meta.trans_name = Some("石火".to_string());
+        meta.album_trans_name = Some("  ".to_string());
+        let card = build_card(&meta, None, &shown);
+        assert_eq!(card.details, "石火");
+        assert_eq!(card.third_line.as_deref(), Some("聖槍爆裂ボーイ"));
     }
 
     #[test]

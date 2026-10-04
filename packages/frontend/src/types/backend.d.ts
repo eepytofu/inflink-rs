@@ -55,13 +55,13 @@ export interface MetadataPayload {
 	artists?: MetadataArtistPayload[] | undefined;
 	albumId?: number | undefined;
 	transName?: string | undefined;
+	albumTransName?: string | undefined;
 	kind?: SongType | undefined;
 }
 
 export interface MetadataArtistPayload {
 	name: string;
 	id?: number | undefined;
-	transName?: string | undefined;
 }
 
 export interface AudioInfoPayload {

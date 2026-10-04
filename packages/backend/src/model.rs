@@ -70,8 +70,6 @@ pub struct ArtistPayload {
     pub name: String,
     #[serde(default)]
     pub id: Option<u64>,
-    #[serde(default)]
-    pub trans_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +97,8 @@ pub struct MetadataPayload {
     pub album_id: Option<u64>,
     #[serde(default)]
     pub trans_name: Option<String>,
+    #[serde(default)]
+    pub album_trans_name: Option<String>,
     /// 只有 `Song` 的 ID 才是曲库 ID, 播客和本地歌曲的 ID 不能用来拼链接
     #[serde(default)]
     pub kind: Option<SongKind>,

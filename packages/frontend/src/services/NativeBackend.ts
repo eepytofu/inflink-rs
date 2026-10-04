@@ -322,6 +322,7 @@ class NativeBackend {
 			artists: songInfo.artists,
 			albumId: songInfo.albumId,
 			transName: songInfo.transName,
+			albumTransName: songInfo.albumTransName,
 			kind: songInfo.type,
 		};
 	}

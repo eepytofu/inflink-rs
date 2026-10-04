@@ -636,6 +636,7 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 			artists: toArtistInfos(playingInfo.resourceArtists),
 			albumId: parseCatalogId(playingInfo.curTrack?.album?.id),
 			transName: firstNonEmpty(playingInfo.curTrack?.transNames),
+			albumTransName: firstNonEmpty(playingInfo.curTrack?.album?.transNames),
 			alias: alias?.length ? alias : undefined,
 			type: currentTrackId > 0 ? "song" : "local",
 		};

@@ -308,6 +308,7 @@ mod tests {
             artists: Vec::new(),
             album_id: None,
             trans_name: None,
+            album_trans_name: None,
             kind: None,
         }
     }

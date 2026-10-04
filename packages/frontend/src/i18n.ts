@@ -48,7 +48,7 @@ const zh = {
 	artistSeparator: "歌手分隔符",
 	artistSeparatorDesc: "有多位歌手时用来分隔歌手名",
 	showTranslation: "显示翻译名",
-	showTranslationDesc: "在歌曲名和歌手名后面附上网易云提供的译名",
+	showTranslationDesc: "在歌曲名和专辑名后面附上网易云提供的译名",
 	links: "可点击链接",
 	linksDesc: "点击歌曲名、歌手名和封面可以打开对应的网易云页面",
 
@@ -115,7 +115,7 @@ const en: Dictionary = {
 	artistSeparatorDesc: "Separates artist names when there are several",
 	showTranslation: "Show translated names",
 	showTranslationDesc:
-		"Append NetEase's translated names after the song and artist names",
+		"Append NetEase's translated names after the song and album names",
 	links: "Clickable links",
 	linksDesc:
 		"Clicking the song, artists and cover opens the matching NetEase page",
