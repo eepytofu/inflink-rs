@@ -202,7 +202,7 @@ fn audio_codec(audio: &AudioInfoPayload) -> Option<String> {
         .map(codec_name)
 }
 
-/// `24-bit/48 kHz`, 写法跟 Apple Music 的 `ALAC 24-bit/48 kHz` 一致
+/// `24-bit/48 kHz`. The codec goes after it, as in Apple Music's `24-bit/96 kHz ALAC`.
 fn format_sample(audio: &AudioInfoPayload) -> Option<String> {
     let bit_depth = audio.bit_depth.filter(|b| *b > 0);
     let sample_rate = audio.sample_rate.filter(|s| *s > 0);
@@ -232,12 +232,12 @@ fn is_lossless(audio: &AudioInfoPayload) -> bool {
         })
 }
 
-/// 拿到的每一项都写出来: `FLAC 24-bit/48 kHz, 1695 kbps`、`AAC 48 kHz, 256 kbps`
+/// 拿到的每一项都写出来: `24-bit/48 kHz FLAC, 1695 kbps`、`48 kHz AAC, 256 kbps`
 ///
 /// 不带网易云的音质档位名字 (Lossless、Hi-Res、Standard 之类): 有了位深和采样率之后
 /// 它没有再多说明什么, `Standard` 这样的名字离开网易云也没人知道指的是什么。
 fn format_audio_full(audio: &AudioInfoPayload) -> Option<String> {
-    let format = [audio_codec(audio), format_sample(audio)]
+    let format = [format_sample(audio), audio_codec(audio)]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -253,9 +253,9 @@ fn format_audio_full(audio: &AudioInfoPayload) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// 只写最能说明质量的那一项: `FLAC 24-bit/48 kHz`、`AAC 256 kbps`
+/// 只写最能说明质量的那一项: `24-bit/48 kHz FLAC`、`256 kbps AAC`
 ///
-/// 那一项缺失时用另一项顶上, 例如读不到文件头的无损文件写成 `FLAC 1695 kbps`。
+/// 那一项缺失时用另一项顶上, 例如读不到文件头的无损文件写成 `1695 kbps FLAC`。
 fn format_audio_compact(audio: &AudioInfoPayload) -> Option<String> {
     let (sample, bitrate) = (format_sample(audio), format_bitrate(audio));
     let quality = if is_lossless(audio) {
@@ -264,7 +264,7 @@ fn format_audio_compact(audio: &AudioInfoPayload) -> Option<String> {
         bitrate.or(sample)
     };
 
-    let parts: Vec<String> = [audio_codec(audio), quality]
+    let parts: Vec<String> = [quality, audio_codec(audio)]
         .into_iter()
         .flatten()
         .collect();
@@ -1102,7 +1102,7 @@ mod tests {
         let line = |a| format_audio_full(&a);
         assert_eq!(
             line(audio(Some("flac"), Some(1_596_360), Some(44_100), None)).as_deref(),
-            Some("FLAC 44.1 kHz, 1596 kbps")
+            Some("44.1 kHz FLAC, 1596 kbps")
         );
         assert_eq!(
             line(audio(Some("flac"), Some(1_869_617), None, None)).as_deref(),
@@ -1110,7 +1110,7 @@ mod tests {
         );
         assert_eq!(
             line(audio(Some("flac"), Some(985_000), Some(44_100), Some(16))).as_deref(),
-            Some("FLAC 16-bit/44.1 kHz, 985 kbps")
+            Some("16-bit/44.1 kHz FLAC, 985 kbps")
         );
         assert_eq!(
             line(audio(None, Some(320_000), None, None)).as_deref(),
@@ -1118,14 +1118,14 @@ mod tests {
         );
         assert_eq!(
             line(audio(Some("flac"), None, None, Some(24))).as_deref(),
-            Some("FLAC 24-bit")
+            Some("24-bit FLAC")
         );
         assert_eq!(line(audio(None, None, None, None)), None);
         assert_eq!(line(audio(Some(" "), Some(0), Some(0), Some(0))), None);
 
         // 最长的常见写法也要能放进卡片的一行 (大约 37 个字符)
         let longest = line(audio(Some("flac"), Some(1_717_000), Some(44_100), Some(24))).unwrap();
-        assert_eq!(longest, "FLAC 24-bit/44.1 kHz, 1717 kbps");
+        assert_eq!(longest, "24-bit/44.1 kHz FLAC, 1717 kbps");
         assert!(longest.chars().count() <= 37);
     }
 
@@ -1136,30 +1136,30 @@ mod tests {
         // 无损看位深和采样率
         assert_eq!(
             line(audio(Some("flac"), Some(985_000), Some(44_100), Some(16))).as_deref(),
-            Some("FLAC 16-bit/44.1 kHz")
+            Some("16-bit/44.1 kHz FLAC")
         );
         assert_eq!(
             line(audio(Some("flac"), Some(1_596_360), Some(44_100), None)).as_deref(),
-            Some("FLAC 44.1 kHz")
+            Some("44.1 kHz FLAC")
         );
         // 有损看码率
         assert_eq!(
             line(audio(Some("m4a"), Some(256_016), Some(48_000), None)).as_deref(),
-            Some("AAC 256 kbps")
+            Some("256 kbps AAC")
         );
         assert_eq!(
             line(audio(Some("mp3"), Some(320_000), Some(44_100), None)).as_deref(),
-            Some("MP3 320 kbps")
+            Some("320 kbps MP3")
         );
 
         // 该看的那一项缺失时, 用另一项顶上
         assert_eq!(
             line(audio(Some("flac"), Some(1_869_617), None, None)).as_deref(),
-            Some("FLAC 1870 kbps")
+            Some("1870 kbps FLAC")
         );
         assert_eq!(
             line(audio(Some("mp3"), None, Some(44_100), None)).as_deref(),
-            Some("MP3 44.1 kHz")
+            Some("44.1 kHz MP3")
         );
         assert_eq!(
             line(audio(None, Some(320_000), None, None)).as_deref(),
@@ -1178,29 +1178,29 @@ mod tests {
         let cases = [
             (
                 audio(Some("m4a"), Some(96_007), Some(48_000), None),
-                "AAC 48 kHz, 96 kbps",
-                "AAC 96 kbps",
+                "48 kHz AAC, 96 kbps",
+                "96 kbps AAC",
             ),
             (
                 audio(Some("m4a"), Some(256_016), Some(48_000), None),
-                "AAC 48 kHz, 256 kbps",
-                "AAC 256 kbps",
+                "48 kHz AAC, 256 kbps",
+                "256 kbps AAC",
             ),
             (
                 audio(Some("mp3"), Some(320_000), Some(44_100), None),
-                "MP3 44.1 kHz, 320 kbps",
-                "MP3 320 kbps",
+                "44.1 kHz MP3, 320 kbps",
+                "320 kbps MP3",
             ),
             (
                 audio(Some("flac"), Some(1_103_664), Some(48_000), None),
-                "FLAC 48 kHz, 1104 kbps",
-                "FLAC 48 kHz",
+                "48 kHz FLAC, 1104 kbps",
+                "48 kHz FLAC",
             ),
             // 位深读自缓存文件头
             (
                 audio(Some("flac"), Some(1_694_785), Some(48_000), Some(24)),
-                "FLAC 24-bit/48 kHz, 1695 kbps",
-                "FLAC 24-bit/48 kHz",
+                "24-bit/48 kHz FLAC, 1695 kbps",
+                "24-bit/48 kHz FLAC",
             ),
         ];
 
@@ -1220,7 +1220,7 @@ mod tests {
         );
         assert_eq!(
             format_audio_compact(&cached).as_deref(),
-            Some("FLAC 1870 kbps")
+            Some("1870 kbps FLAC")
         );
     }
 
@@ -1234,14 +1234,14 @@ mod tests {
 
         let cases = [
             (DiscordThirdLine::Album, album.to_string()),
-            (DiscordThirdLine::Compact, "FLAC 16-bit/48 kHz".to_string()),
+            (DiscordThirdLine::Compact, "16-bit/48 kHz FLAC".to_string()),
             (
                 DiscordThirdLine::QualityAndAlbum,
-                format!("FLAC 16-bit/48 kHz · {album}"),
+                format!("16-bit/48 kHz FLAC · {album}"),
             ),
             (
                 DiscordThirdLine::Full,
-                "FLAC 16-bit/48 kHz, 1104 kbps".to_string(),
+                "16-bit/48 kHz FLAC, 1104 kbps".to_string(),
             ),
         ];
         for (choice, expected) in cases {
@@ -1253,7 +1253,7 @@ mod tests {
         let lossy = audio(Some("m4a"), Some(256_016), Some(48_000), None);
         assert_eq!(
             line(DiscordThirdLine::QualityAndAlbum, Some(&lossy)),
-            Some(format!("AAC 256 kbps · {album}"))
+            Some(format!("256 kbps AAC · {album}"))
         );
     }
 
@@ -1269,7 +1269,7 @@ mod tests {
             &third_line(DiscordThirdLine::QualityAndAlbum),
         );
         let line = card.third_line.unwrap();
-        assert!(line.starts_with("FLAC 24-bit/48 kHz · 专"));
+        assert!(line.starts_with("24-bit/48 kHz FLAC · 专"));
         assert_eq!(line.chars().count(), FIELD_MAX_CHARS);
     }
 
@@ -1687,7 +1687,7 @@ mod tests {
         );
         assert_eq!(
             third(&activities[0]),
-            Some("FLAC 24-bit/44.1 kHz, 1596 kbps")
+            Some("24-bit/44.1 kHz FLAC, 1596 kbps")
         );
     }
 
@@ -1716,7 +1716,7 @@ mod tests {
         let activities = rig.activities();
         assert_eq!(activities.len(), 2);
         assert_eq!(activities[1]["details"], "B");
-        assert_eq!(third(&activities[1]), Some("MP3 48 kHz, 320 kbps"));
+        assert_eq!(third(&activities[1]), Some("48 kHz MP3, 320 kbps"));
     }
 
     #[test]
@@ -1740,7 +1740,7 @@ mod tests {
         assert_eq!(writes, [4100]);
         let activities = rig.activities();
         assert_eq!(third(&activities[0]), None);
-        assert_eq!(third(&activities[1]), Some("FLAC 24-bit/48 kHz, 1596 kbps"));
+        assert_eq!(third(&activities[1]), Some("24-bit/48 kHz FLAC, 1596 kbps"));
         assert_eq!(activities[0]["timestamps"], activities[1]["timestamps"]);
     }
 
@@ -1765,7 +1765,7 @@ mod tests {
         assert_eq!(rig.run(0, 10_000), [100]);
         assert_eq!(
             third(&rig.activities()[0]),
-            Some("FLAC 24-bit/48 kHz, 1596 kbps")
+            Some("24-bit/48 kHz FLAC, 1596 kbps")
         );
     }
 
@@ -1802,7 +1802,7 @@ mod tests {
         assert_eq!(rig.play(0, 20_000, 0.0), [100]);
         assert_eq!(
             third(&rig.activities()[0]),
-            Some("FLAC 24-bit/48 kHz, 1596 kbps")
+            Some("24-bit/48 kHz FLAC, 1596 kbps")
         );
     }
 
@@ -1829,7 +1829,7 @@ mod tests {
         rig.run(0, 5000);
         assert_eq!(
             third(&rig.activities()[0]),
-            Some("FLAC 44.1 kHz, 1596 kbps")
+            Some("44.1 kHz FLAC, 1596 kbps")
         );
     }
 

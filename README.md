@@ -10,7 +10,7 @@ sorry for the english, 我的中文不好.
 
 * song, artist and cover on the discord card are clickable
 * artists can be joined with a comma (default) or a slash
-* third line can be the album (default), the quality netease actually delivered (e.g. `FLAC 24-bit/48 kHz`, `AAC 256 kbps`), or both
+* third line can be the album (default), the quality netease actually delivered (e.g. `24-bit/48 kHz FLAC`, `256 kbps AAC`), or both
 * song and album can show netease's translated name in brackets (off by default)
 * song info shows up on discord and smtc right away instead of waiting for the cover
 * small icon is no longer cropped

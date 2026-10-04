@@ -156,9 +156,9 @@ export function FeatureSettings() {
 	// 直接拿实际效果当选项名，比起名字更一目了然
 	const thirdLineOptions = [
 		{ label: t.optAlbum, value: "Album" },
-		{ label: "FLAC 24-bit/48 kHz", value: "Compact" },
-		{ label: `FLAC 24-bit/48 kHz · ${t.optAlbum}`, value: "QualityAndAlbum" },
-		{ label: "FLAC 24-bit/48 kHz, 1695 kbps", value: "Full" },
+		{ label: "24-bit/48 kHz FLAC", value: "Compact" },
+		{ label: `24-bit/48 kHz FLAC · ${t.optAlbum}`, value: "QualityAndAlbum" },
+		{ label: "24-bit/48 kHz FLAC, 1695 kbps", value: "Full" },
 	];
 
 	const artistSeparatorOptions = [
