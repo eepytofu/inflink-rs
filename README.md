@@ -6,9 +6,11 @@
 
 sorry for the english, 我的中文不好.
 
+<img src="./assets/discord-card.avif" width="268" alt="discord card showing FLAC 24-bit/48 kHz and the album on the third line">
+
 * song, artist and cover on the discord card are clickable
 * artists can be joined with a comma (default) or a slash
-* third line can be album (default) or the quality netease actually delivered (e.g. `FLAC 24-bit/48 kHz`, `AAC 256 kbps`)
+* third line can be the album (default), the quality netease actually delivered (e.g. `FLAC 24-bit/48 kHz`, `AAC 256 kbps`), or both (`FLAC 24-bit/48 kHz · album`)
 * song info shows up on discord and smtc right away instead of waiting for the cover
 * small icon is no longer cropped
 * english settings page
