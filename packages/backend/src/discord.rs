@@ -191,8 +191,7 @@ fn format_khz(hz: u32) -> String {
 
 /// 网易云下发的音质档位代码对应的名字, 代码取自客户端自己的档位表
 ///
-/// 名字沿用网易云音质选择面板里的英文。`jyeffect` 和 `jymaster` 实测下发的就是
-/// 无损档的文件, 由客户端在本地处理, 所以它们的名字必须显示出来, 不能只留下数字
+/// 名字沿用网易云音质选择面板里的英文, 只用在 "档位 · 专辑名" 这种写法里
 fn tier_label(level: &str) -> Option<&'static str> {
     Some(match level {
         "standard" => "Standard",
@@ -235,52 +234,73 @@ fn format_audio_tier(audio: &AudioInfoPayload) -> Option<String> {
         .or_else(|| audio_codec(audio))
 }
 
-/// 形如 `FLAC 48 kHz, 1104 kbps` (紧凑时是 `FLAC 48k, 1104k`), 只拼接确实拿到的部分
-fn format_audio_specs(audio: &AudioInfoPayload, compact: bool) -> Option<String> {
-    let (khz, kbps, bits) = if compact {
-        ("k", "k", "")
-    } else {
-        (" kHz", " kbps", "-bit")
-    };
-
+/// `24-bit/48 kHz`, 写法跟 Apple Music 的 `ALAC 24-bit/48 kHz` 一致
+fn format_sample(audio: &AudioInfoPayload) -> Option<String> {
     let bit_depth = audio.bit_depth.filter(|b| *b > 0);
     let sample_rate = audio.sample_rate.filter(|s| *s > 0);
-    // 写法跟 Apple Music 的 `ALAC 24-bit/48 kHz` 一致: 编码格式和采样率连在一起
-    let sample = match (bit_depth, sample_rate) {
-        (Some(depth), Some(hz)) => Some(format!("{depth}{bits}/{}{khz}", format_khz(hz))),
-        (None, Some(hz)) => Some(format!("{}{khz}", format_khz(hz))),
+    match (bit_depth, sample_rate) {
+        (Some(depth), Some(hz)) => Some(format!("{depth}-bit/{} kHz", format_khz(hz))),
+        (None, Some(hz)) => Some(format!("{} kHz", format_khz(hz))),
         (Some(depth), None) => Some(format!("{depth}-bit")),
         (None, None) => None,
-    };
-    let format = [audio_codec(audio), sample]
+    }
+}
+
+fn format_bitrate(audio: &AudioInfoPayload) -> Option<String> {
+    audio
+        .bitrate
+        .filter(|b| *b > 0)
+        .map(|b| format!("{} kbps", (b + 500) / 1000))
+}
+
+/// 无损格式的质量看位深和采样率, 有损格式的质量看码率
+fn is_lossless(audio: &AudioInfoPayload) -> bool {
+    audio.bit_depth.is_some_and(|b| b > 0)
+        || audio.codec.as_deref().is_some_and(|codec| {
+            matches!(
+                codec.trim().to_lowercase().as_str(),
+                "flac" | "alac" | "wav" | "ape"
+            )
+        })
+}
+
+/// 拿到的每一项都写出来: `FLAC 24-bit/48 kHz, 1695 kbps`、`AAC 48 kHz, 256 kbps`
+///
+/// 不带音质档位的名字: 有了位深和采样率之后, 档位名字没有再多说明什么, 而且
+/// `Standard` 这样的名字离开网易云就没人知道指的是什么。
+fn format_audio_full(audio: &AudioInfoPayload) -> Option<String> {
+    let format = [audio_codec(audio), format_sample(audio)]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-    let bitrate = audio
-        .bitrate
-        .filter(|b| *b > 0)
-        .map(|b| format!("{}{kbps}", (b + 500) / 1000));
 
-    let parts: Vec<String> = [Some(format).filter(|f| !f.is_empty()), bitrate]
-        .into_iter()
-        .flatten()
-        .collect();
+    let parts: Vec<String> = [
+        Some(format).filter(|f| !f.is_empty()),
+        format_bitrate(audio),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// 形如 `Lossless · FLAC 48 kHz, 1104 kbps`
-fn format_audio_line(audio: &AudioInfoPayload, compact: bool) -> Option<String> {
-    let tier = audio
-        .level
-        .as_deref()
-        .and_then(tier_label)
-        .map(str::to_string);
-    let parts: Vec<String> = [tier, format_audio_specs(audio, compact)]
+/// 只写最能说明质量的那一项: `FLAC 24-bit/48 kHz`、`AAC 256 kbps`
+///
+/// 那一项缺失时用另一项顶上, 例如读不到文件头的无损文件写成 `FLAC 1695 kbps`。
+fn format_audio_compact(audio: &AudioInfoPayload) -> Option<String> {
+    let (sample, bitrate) = (format_sample(audio), format_bitrate(audio));
+    let quality = if is_lossless(audio) {
+        sample.or(bitrate)
+    } else {
+        bitrate.or(sample)
+    };
+
+    let parts: Vec<String> = [audio_codec(audio), quality]
         .into_iter()
         .flatten()
         .collect();
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn catalog_url(path: &str, id: Option<u64>) -> Option<String> {
@@ -347,7 +367,6 @@ fn build_card_with(
     // 确定读不到规格时 (v2 客户端、本地歌曲、播客) 一律退回专辑名
     let third_line = match options.third_line {
         DiscordThirdLine::Album => metadata.album_name.clone(),
-        DiscordThirdLine::Tier => audio.and_then(format_audio_tier).unwrap_or_else(album),
         // 档位放前面: 一行放不下时被截掉的是专辑名
         DiscordThirdLine::TierAndAlbum => match audio.and_then(format_audio_tier) {
             Some(tier) if long_enough(&metadata.album_name) => {
@@ -356,12 +375,8 @@ fn build_card_with(
             Some(tier) => tier,
             None => metadata.album_name.clone(),
         },
-        DiscordThirdLine::Full => audio
-            .and_then(|a| format_audio_line(a, false))
-            .unwrap_or_else(album),
-        DiscordThirdLine::Compact => audio
-            .and_then(|a| format_audio_line(a, true))
-            .unwrap_or_else(album),
+        DiscordThirdLine::Full => audio.and_then(format_audio_full).unwrap_or_else(album),
+        DiscordThirdLine::Compact => audio.and_then(format_audio_compact).unwrap_or_else(album),
     };
 
     let link = |url: Option<String>| url.filter(|_| options.links && in_catalog);
@@ -1119,8 +1134,8 @@ mod tests {
     }
 
     #[test]
-    fn audio_line_shows_only_what_is_known() {
-        let line = |a| format_audio_line(&a, false);
+    fn full_line_shows_everything_that_is_known() {
+        let line = |a| format_audio_full(&a);
         assert_eq!(
             line(audio(Some("flac"), Some(1_596_360), Some(44_100), None)).as_deref(),
             Some("FLAC 44.1 kHz, 1596 kbps")
@@ -1143,29 +1158,59 @@ mod tests {
         );
         assert_eq!(line(audio(None, None, None, None)), None);
         assert_eq!(line(audio(Some(" "), Some(0), Some(0), Some(0))), None);
+
+        // 最长的常见写法也要能放进卡片的一行 (大约 37 个字符)
+        let longest = line(audio(Some("flac"), Some(1_717_000), Some(44_100), Some(24))).unwrap();
+        assert_eq!(longest, "FLAC 24-bit/44.1 kHz, 1717 kbps");
+        assert!(longest.chars().count() <= 37);
     }
 
     #[test]
-    fn compact_audio_line_shortens_every_unit_to_k() {
-        let line = |a| format_audio_line(&a, true);
-        assert_eq!(
-            line(audio(Some("flac"), Some(1_596_360), Some(44_100), None)).as_deref(),
-            Some("FLAC 44.1k, 1596k")
-        );
+    fn compact_line_shows_the_one_number_that_says_the_quality() {
+        let line = |a| format_audio_compact(&a);
+
+        // 无损看位深和采样率
         assert_eq!(
             line(audio(Some("flac"), Some(985_000), Some(44_100), Some(16))).as_deref(),
-            Some("FLAC 16/44.1k, 985k")
+            Some("FLAC 16-bit/44.1 kHz")
+        );
+        assert_eq!(
+            line(audio(Some("flac"), Some(1_596_360), Some(44_100), None)).as_deref(),
+            Some("FLAC 44.1 kHz")
+        );
+        // 有损看码率
+        assert_eq!(
+            line(audio(Some("m4a"), Some(256_016), Some(48_000), None)).as_deref(),
+            Some("AAC 256 kbps")
+        );
+        assert_eq!(
+            line(audio(Some("mp3"), Some(320_000), Some(44_100), None)).as_deref(),
+            Some("MP3 320 kbps")
+        );
+
+        // 该看的那一项缺失时, 用另一项顶上
+        assert_eq!(
+            line(audio(Some("flac"), Some(1_869_617), None, None)).as_deref(),
+            Some("FLAC 1870 kbps")
+        );
+        assert_eq!(
+            line(audio(Some("mp3"), None, Some(44_100), None)).as_deref(),
+            Some("MP3 44.1 kHz")
         );
         assert_eq!(
             line(audio(None, Some(320_000), None, None)).as_deref(),
-            Some("320k")
+            Some("320 kbps")
+        );
+        assert_eq!(
+            line(audio(Some("flac"), None, None, None)).as_deref(),
+            Some("FLAC")
         );
         assert_eq!(line(audio(None, None, None, None)), None);
     }
 
-    /// 数值全部来自实机: 同一首歌在各个档位下网易云实际下发的音频流
+    /// 数值全部来自实机: 网易云在各个档位下实际下发的音频流
     #[test]
-    fn tiers_read_the_way_netease_names_them() {
+    fn real_streams_read_without_the_tier_name() {
         let lossless_file = || audio(Some("flac"), Some(1_103_664), Some(48_000), None);
         let cases = [
             (
@@ -1173,8 +1218,8 @@ mod tests {
                     "standard",
                     audio(Some("m4a"), Some(96_007), Some(48_000), None),
                 ),
-                "Standard · AAC 48 kHz, 96 kbps",
-                "Standard · AAC 48k, 96k",
+                "AAC 48 kHz, 96 kbps",
+                "AAC 96 kbps",
                 "Standard",
             ),
             (
@@ -1182,8 +1227,8 @@ mod tests {
                     "exhigh",
                     audio(Some("m4a"), Some(256_016), Some(48_000), None),
                 ),
-                "HQ · AAC 48 kHz, 256 kbps",
-                "HQ · AAC 48k, 256k",
+                "AAC 48 kHz, 256 kbps",
+                "AAC 256 kbps",
                 "HQ",
             ),
             (
@@ -1191,66 +1236,64 @@ mod tests {
                     "exhigh",
                     audio(Some("mp3"), Some(320_000), Some(44_100), None),
                 ),
-                "HQ · MP3 44.1 kHz, 320 kbps",
-                "HQ · MP3 44.1k, 320k",
+                "MP3 44.1 kHz, 320 kbps",
+                "MP3 320 kbps",
                 "HQ",
             ),
             (
                 tiered("lossless", lossless_file()),
-                "Lossless · FLAC 48 kHz, 1104 kbps",
-                "Lossless · FLAC 48k, 1104k",
+                "FLAC 48 kHz, 1104 kbps",
+                "FLAC 48 kHz",
                 "Lossless",
             ),
+            // 位深读自缓存文件头
             (
                 tiered(
                     "hires",
-                    audio(Some("flac"), Some(1_869_617), Some(48_000), None),
+                    audio(Some("flac"), Some(1_694_785), Some(48_000), Some(24)),
                 ),
-                "Hi-Res · FLAC 48 kHz, 1870 kbps",
-                "Hi-Res · FLAC 48k, 1870k",
+                "FLAC 24-bit/48 kHz, 1695 kbps",
+                "FLAC 24-bit/48 kHz",
                 "Hi-Res",
             ),
-            // 这两个档位下发的就是无损档的文件
             (
                 tiered("jyeffect", lossless_file()),
-                "Spatial Audio · FLAC 48 kHz, 1104 kbps",
-                "Spatial Audio · FLAC 48k, 1104k",
+                "FLAC 48 kHz, 1104 kbps",
+                "FLAC 48 kHz",
                 "Spatial Audio",
             ),
             (
                 tiered("jymaster", lossless_file()),
-                "Master · FLAC 48 kHz, 1104 kbps",
-                "Master · FLAC 48k, 1104k",
+                "FLAC 48 kHz, 1104 kbps",
+                "FLAC 48 kHz",
                 "Master",
             ),
         ];
 
         for (spec, full, compact, tier) in cases {
-            assert_eq!(format_audio_line(&spec, false).as_deref(), Some(full));
-            assert_eq!(format_audio_line(&spec, true).as_deref(), Some(compact));
+            assert_eq!(format_audio_full(&spec).as_deref(), Some(full));
+            assert_eq!(format_audio_compact(&spec).as_deref(), Some(compact));
             assert_eq!(format_audio_tier(&spec).as_deref(), Some(tier));
-            // 紧凑写法必须能放进卡片的一行 (大约 37 个字符)
-            assert!(compact.chars().count() <= 37, "{compact}");
         }
     }
 
     #[test]
     fn missing_numbers_and_unknown_tiers_degrade_gracefully() {
-        // 从磁盘缓存恢复的条目没有采样率
+        // 读不到文件头的无损文件: 既没有采样率也没有位深
         let cached = tiered("hires", audio(Some("flac"), Some(1_869_617), None, None));
         assert_eq!(
-            format_audio_line(&cached, true).as_deref(),
-            Some("Hi-Res · FLAC, 1870k")
+            format_audio_full(&cached).as_deref(),
+            Some("FLAC, 1870 kbps")
+        );
+        assert_eq!(
+            format_audio_compact(&cached).as_deref(),
+            Some("FLAC 1870 kbps")
         );
 
-        // 没见过的档位代码不猜名字: 完整写法里只剩规格, 只显示档位时用编码格式顶上
+        // 没见过的档位代码不猜名字, 用编码格式顶上
         let unknown = tiered(
             "future",
             audio(Some("flac"), Some(1_103_664), Some(48_000), None),
-        );
-        assert_eq!(
-            format_audio_line(&unknown, true).as_deref(),
-            Some("FLAC 48k, 1104k")
         );
         assert_eq!(format_audio_tier(&unknown).as_deref(), Some("FLAC"));
         assert_eq!(format_audio_tier(&audio(None, None, None, None)), None);
@@ -1260,7 +1303,7 @@ mod tests {
     fn third_line_choices() {
         let spec = tiered(
             "lossless",
-            audio(Some("flac"), Some(1_103_664), Some(48_000), None),
+            audio(Some("flac"), Some(1_103_664), Some(48_000), Some(16)),
         );
         let line = |choice, audio: Option<&AudioInfoPayload>| {
             build_card(&metadata(), audio, &third_line(choice)).third_line
@@ -1269,25 +1312,30 @@ mod tests {
 
         let cases = [
             (DiscordThirdLine::Album, album.to_string()),
-            (DiscordThirdLine::Tier, "Lossless".to_string()),
             (
                 DiscordThirdLine::TierAndAlbum,
                 format!("Lossless · {album}"),
             ),
             (
                 DiscordThirdLine::Full,
-                "Lossless · FLAC 48 kHz, 1104 kbps".to_string(),
+                "FLAC 16-bit/48 kHz, 1104 kbps".to_string(),
             ),
-            (
-                DiscordThirdLine::Compact,
-                "Lossless · FLAC 48k, 1104k".to_string(),
-            ),
+            (DiscordThirdLine::Compact, "FLAC 16-bit/48 kHz".to_string()),
         ];
         for (choice, expected) in cases {
             assert_eq!(line(choice, Some(&spec)), Some(expected), "{choice:?}");
             // 读不到规格时, 每一种选择都退回专辑名
             assert_eq!(line(choice, None).as_deref(), Some(album), "{choice:?}");
         }
+    }
+
+    /// 只显示档位的选项已经并入 "档位 · 专辑名", 存储里残留的旧取值不能让整条配置被拒绝
+    #[test]
+    fn the_retired_tier_only_choice_reads_as_tier_and_album() {
+        let parse = |json| serde_json::from_str::<DiscordThirdLine>(json).unwrap();
+        assert_eq!(parse(r#""Tier""#), DiscordThirdLine::TierAndAlbum);
+        assert_eq!(parse(r#""TierAndAlbum""#), DiscordThirdLine::TierAndAlbum);
+        assert_eq!(parse(r#""Compact""#), DiscordThirdLine::Compact);
     }
 
     #[test]
@@ -1445,11 +1493,7 @@ mod tests {
         };
         let album = "2026哔哩哔哩拜年纪";
 
-        for choice in [
-            DiscordThirdLine::Tier,
-            DiscordThirdLine::Full,
-            DiscordThirdLine::Compact,
-        ] {
+        for choice in [DiscordThirdLine::Full, DiscordThirdLine::Compact] {
             assert_eq!(line(choice, true), None, "{choice:?}");
             // 确定读不到规格时才退回专辑名
             assert_eq!(line(choice, false).as_deref(), Some(album), "{choice:?}");

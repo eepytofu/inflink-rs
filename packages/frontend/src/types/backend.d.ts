@@ -133,12 +133,7 @@ export type AppMessage = {
 
 export type DiscordDisplayMode = "Name" | "State" | "Details";
 
-export type DiscordThirdLine =
-	| "Album"
-	| "Tier"
-	| "TierAndAlbum"
-	| "Full"
-	| "Compact";
+export type DiscordThirdLine = "Album" | "TierAndAlbum" | "Full" | "Compact";
 export type DiscordArtistSeparator = "Comma" | "Slash";
 
 export interface DiscordConfigPayload {
