@@ -1,5 +1,8 @@
 mod array_buffer;
+mod audio_header;
 mod discord;
+mod discord_ipc;
+mod discord_policy;
 mod dispatcher;
 mod ffi;
 mod ffi_support;

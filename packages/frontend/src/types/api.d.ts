@@ -71,8 +71,8 @@ export interface SongInfo {
 /**
  * 当前音频流的真实规格
  *
- * 所有字段都来自网易云实际下发的音频流信息，拿不到的字段不存在，
- * 不会用音质档位的宣传参数去填充
+ * 所有字段都来自网易云实际下发的音频流信息和缓存的音频文件头，拿不到的字段
+ * 不存在，不会用音质档位的宣传参数去填充
  * @since 插件版本 3.4.0
  */
 export interface AudioInfo {
@@ -84,7 +84,7 @@ export interface AudioInfo {
 	bitrate?: number | undefined;
 	/** 采样率，单位 Hz */
 	sampleRate?: number | undefined;
-	/** 位深 */
+	/** 位深，读自缓存的 FLAC 文件头，有损格式没有 */
 	bitDepth?: number | undefined;
 	/** 网易云实际下发的音质档位，例如 "lossless"、"hires" */
 	level?: string | undefined;

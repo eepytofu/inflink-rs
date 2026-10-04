@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         LazyLock,
         Mutex,
@@ -11,22 +12,21 @@ use std::{
     thread,
     time::{
         Duration,
-        SystemTime,
-        UNIX_EPOCH,
+        Instant,
     },
 };
 
-use discord_rich_presence::{
-    DiscordIpc,
-    DiscordIpcClient,
-    activity::{
-        Activity,
-        ActivityType,
-        Assets,
-        Button,
-        StatusDisplayType,
-        Timestamps,
-    },
+use discord_rich_presence::activity::{
+    Activity,
+    ActivityType,
+    Assets,
+    Button,
+    StatusDisplayType,
+    Timestamps,
+};
+use serde_json::{
+    Value,
+    json,
 };
 use tracing::{
     debug,
@@ -34,19 +34,34 @@ use tracing::{
     warn,
 };
 
-use crate::model::{
-    AudioInfoPayload,
-    DiscordAppNameMode,
-    DiscordArtistSeparator,
-    DiscordConfigPayload,
-    DiscordDisplayMode,
-    DiscordThirdLine,
-    MetadataPayload,
-    PlayStatePayload,
-    PlaybackStatus,
-    SharedMetadata,
-    SongKind,
-    TimelinePayload,
+use crate::{
+    discord_ipc::{
+        Connector,
+        OP_CLOSE,
+        OP_FRAME,
+        OP_PING,
+        OP_PONG,
+        PipeConnector,
+        Transport,
+    },
+    discord_policy::SendPolicy,
+    model::{
+        AudioHeaderSpecs,
+        AudioInfoPayload,
+        DiscordAppNameMode,
+        DiscordArtistSeparator,
+        DiscordConfigPayload,
+        DiscordDisplayMode,
+        DiscordThirdLine,
+        MetadataPayload,
+        PlayStatePayload,
+        PlaybackStatus,
+        SongKind,
+        Stamp,
+        TimelinePayload,
+        TimelineReason,
+        TrackUpdate,
+    },
 };
 
 const APP_ID: &str = "1427186361827594375";
@@ -63,21 +78,31 @@ const APP_NAME_EN: &str = "NetEase CloudMusic";
 const FIELD_MAX_CHARS: usize = 128;
 const FIELD_MIN_CHARS: usize = 2;
 
-// 主要用来应对跳转进度的更新
-const TIMESTAMP_UPDATE_THRESHOLD_MS: i64 = 100;
-const RECONNECT_COOLDOWN_SECONDS: u8 = 5;
+// 例行上报的进度和按锚点推算的位置相差超过这个值, 才认为播放位置真的变了。
+// 用户主动跳转不受它限制
+const DRIFT_TOLERANCE_MS: f64 = 1500.0;
+const TRACK_SETTLE: Duration = Duration::from_millis(100);
+const PAUSE_SETTLE: Duration = Duration::from_millis(800);
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+// 没有事情要做时也要定期醒来, 读走 Discord 的回复和心跳
+const IDLE_TICK: Duration = Duration::from_secs(1);
+const RETRY_TICK: Duration = Duration::from_millis(50);
 
 enum RpcMessage {
-    Metadata(SharedMetadata),
+    Track(Box<TrackUpdate>),
     PlayState(PlayStatePayload),
     Timeline(TimelinePayload),
     AudioInfo(AudioInfoPayload),
+    AudioHeader(AudioHeaderSpecs),
     Enable,
     Disable,
     Config(DiscordConfigPayload),
 }
 
-static SENDER: LazyLock<Mutex<Option<Sender<RpcMessage>>>> = LazyLock::new(|| Mutex::new(None));
+type Envelope = (RpcMessage, Stamp);
+
+static SENDER: LazyLock<Mutex<Option<Sender<Envelope>>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CardOptions {
@@ -290,17 +315,38 @@ fn resolve_app_name(mode: &DiscordAppNameMode, metadata: &MetadataPayload) -> St
     }
 }
 
+#[cfg(test)]
 fn build_card(
     metadata: &MetadataPayload,
     audio: Option<&AudioInfoPayload>,
     options: &CardOptions,
 ) -> Card {
+    build_card_with(metadata, audio, false, options)
+}
+
+/// `audio_pending`: 规格还在路上。这时音质行留空, 等规格到了再补上;
+/// 先显示专辑名再换成音质, 看起来就是卡片在闪
+fn build_card_with(
+    metadata: &MetadataPayload,
+    audio: Option<&AudioInfoPayload>,
+    audio_pending: bool,
+    options: &CardOptions,
+) -> Card {
     // 预加载或切歌途中, 规格可能还是上一首歌的
     let audio = audio.filter(|a| metadata.ncm_id == Some(a.ncm_id));
-    let album = || metadata.album_name.clone();
-    // 读不到规格时 (v2 客户端、本地歌曲、播客) 一律退回专辑名
+    // 旧版前端不带 kind, 当时所有 ID 都被当成歌曲 ID
+    let in_catalog = matches!(metadata.kind, None | Some(SongKind::Song));
+    let waiting = audio.is_none() && audio_pending && in_catalog;
+    let album = || {
+        if waiting {
+            String::new()
+        } else {
+            metadata.album_name.clone()
+        }
+    };
+    // 确定读不到规格时 (v2 客户端、本地歌曲、播客) 一律退回专辑名
     let third_line = match options.third_line {
-        DiscordThirdLine::Album => album(),
+        DiscordThirdLine::Album => metadata.album_name.clone(),
         DiscordThirdLine::Tier => audio.and_then(format_audio_tier).unwrap_or_else(album),
         // 档位放前面: 一行放不下时被截掉的是专辑名
         DiscordThirdLine::TierAndAlbum => match audio.and_then(format_audio_tier) {
@@ -308,7 +354,7 @@ fn build_card(
                 format!("{tier} · {}", metadata.album_name)
             }
             Some(tier) => tier,
-            None => album(),
+            None => metadata.album_name.clone(),
         },
         DiscordThirdLine::Full => audio
             .and_then(|a| format_audio_line(a, false))
@@ -318,8 +364,6 @@ fn build_card(
             .unwrap_or_else(album),
     };
 
-    // 旧版前端不带 kind, 当时所有 ID 都被当成歌曲 ID
-    let in_catalog = matches!(metadata.kind, None | Some(SongKind::Song));
     let link = |url: Option<String>| url.filter(|_| options.links && in_catalog);
 
     Card {
@@ -345,84 +389,185 @@ fn build_card(
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct ActivityData {
-    metadata: SharedMetadata,
-    status: PlaybackStatus,
-    current_time: f64,
-    card: Card,
+/// 进度锚点: 某个时刻的播放位置
+///
+/// 卡片上的时间戳只由锚点算出, 不看 "现在"。这样无关的消息 (规格到了、配置变了)
+/// 算出来的时间戳和上次完全一样, 不会因为调度的抖动而重发。
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    position_ms: f64,
+    at: Stamp,
 }
 
-impl ActivityData {
-    fn from_metadata(
-        metadata: SharedMetadata,
-        audio: Option<&AudioInfoPayload>,
-        options: &CardOptions,
-    ) -> Self {
-        let card = build_card(&metadata, audio, options);
-        Self {
-            metadata,
-            status: PlaybackStatus::Paused,
-            current_time: 0.0,
-            card,
+#[derive(Debug, Clone)]
+struct Playback {
+    seq: u64,
+    metadata: MetadataPayload,
+    audio: Option<AudioInfoPayload>,
+    audio_pending: bool,
+    status: PlaybackStatus,
+    anchor: Anchor,
+    // v2 客户端的时长在元数据之后才随进度到达
+    timeline_duration: Option<f64>,
+}
+
+impl Playback {
+    fn position_at(&self, now: Instant) -> f64 {
+        match self.status {
+            PlaybackStatus::Playing => now
+                .saturating_duration_since(self.anchor.at.mono)
+                .as_secs_f64()
+                .mul_add(1000.0, self.anchor.position_ms),
+            PlaybackStatus::Paused => self.anchor.position_ms,
         }
     }
 
-    fn update_metadata(
-        &mut self,
-        metadata: SharedMetadata,
-        audio: Option<&AudioInfoPayload>,
-        options: &CardOptions,
-    ) {
-        self.card = build_card(&metadata, audio, options);
-        self.metadata = metadata;
-        self.current_time = 0.0;
+    fn duration(&self) -> Option<f64> {
+        self.metadata
+            .duration
+            .filter(|d| *d > 0.0)
+            .or_else(|| self.timeline_duration.filter(|d| *d > 0.0))
     }
 
-    fn refresh_card(&mut self, audio: Option<&AudioInfoPayload>, options: &CardOptions) {
-        self.card = build_card(&self.metadata, audio, options);
+    fn timestamps(&self) -> Option<(i64, i64)> {
+        // 来自 https://musicpresence.app/ 的 hack，通过将
+        // 开始和结束时间戳向后平移一年以实现在暂停时进度静止的效果
+        const ONE_YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+        let duration = self.duration()?;
+        let shift = match self.status {
+            PlaybackStatus::Playing => 0,
+            PlaybackStatus::Paused => ONE_YEAR_MS,
+        };
+        let start = self.anchor.at.wall_ms - self.anchor.position_ms as i64 + shift;
+        Some((start, start + duration as i64))
     }
 }
 
+/// 一张完整的卡片。两张卡片相等就不需要再写一次
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CardState {
+    card: Card,
+    display_mode: DiscordDisplayMode,
+    timestamps: Option<(i64, i64)>,
+}
+
+/// 希望 Discord 显示的东西
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Desired {
+    Clear,
+    Card(Box<CardState>),
+}
+
+fn build_activity(state: &CardState) -> Activity<'_> {
+    let card = &state.card;
+
+    let mut assets = Assets::new()
+        .large_image(card.cover.as_str())
+        .small_image(NCM_SMALL_ICON_URL)
+        .small_text(card.app_name.as_str())
+        .small_url(NCM_HOME_URL);
+    // Listening 类型的卡片把 large_text 画成第三行, 它和封面共用 large_url
+    if let Some(third_line) = &card.third_line {
+        assets = assets.large_text(third_line.as_str());
+    }
+    if let Some(url) = &card.album_url {
+        assets = assets.large_url(url.as_str());
+    }
+
+    let buttons = vec![Button::new(
+        "🎧 Listen",
+        card.song_url.as_deref().unwrap_or(NCM_HOME_URL),
+    )];
+
+    let status_type = match state.display_mode {
+        DiscordDisplayMode::Name => StatusDisplayType::Name,
+        DiscordDisplayMode::State => StatusDisplayType::State,
+        DiscordDisplayMode::Details => StatusDisplayType::Details,
+    };
+
+    let mut activity = Activity::new()
+        .name(card.app_name.as_str())
+        .details(card.details.as_str())
+        .state(card.state.as_str())
+        .activity_type(ActivityType::Listening)
+        .assets(assets)
+        .buttons(buttons)
+        .status_display_type(status_type);
+
+    if let Some(url) = &card.song_url {
+        activity = activity.details_url(url.as_str());
+    }
+    if let Some(url) = &card.artist_url {
+        activity = activity.state_url(url.as_str());
+    }
+    if let Some((start, end)) = state.timestamps {
+        activity = activity.timestamps(Timestamps::new().start(start).end(end));
+    }
+
+    activity
+}
+
+/// 一次已经写出、还没等到回复的更新
 #[derive(Debug)]
-struct RpcWorker {
-    client: Option<DiscordIpcClient>,
-    data: Option<ActivityData>,
+struct Awaiting {
+    nonce: String,
+    at: Instant,
+    seq: Option<u64>,
+    desired: Desired,
+}
+
+struct RpcWorker<C: Connector> {
+    connector: C,
+    transport: Option<C::Transport>,
     is_enabled: bool,
-    connect_retry_count: u8,
-    // 上次发送的结束时间戳
-    // 用于防抖，也用于判断是否要清除 Activity
-    last_sent_end_timestamp: Option<i64>,
     show_when_paused: bool,
     display_mode: DiscordDisplayMode,
     options: CardOptions,
-    // 规格可能早于元数据到达 (元数据要等封面), 所以独立于 data 保存
-    audio: Option<AudioInfoPayload>,
+    playback: Option<Playback>,
+    // 规格可能早于它所属的那首歌的快照到达, 这时先存着, 不去动正在显示的卡片
+    pending_audio: Option<AudioInfoPayload>,
+    // 后端自己从缓存文件头读到的规格, 比前端转一圈送回来的早几百毫秒
+    header: Option<AudioHeaderSpecs>,
+    // 这条连接上 Discord 现在拿着什么。`None` 表示不确定 (更新被拒绝之后)
+    last_written: Option<Desired>,
+    // 被 Discord 拒绝的那张卡片, 内容不变就不再重发
+    rejected: Option<Desired>,
+    hold_until: Option<Instant>,
+    policy: SendPolicy,
+    awaiting: VecDeque<Awaiting>,
+    next_connect_at: Option<Instant>,
+    nonce_counter: u64,
 }
 
-impl Default for RpcWorker {
-    fn default() -> Self {
+impl<C: Connector> RpcWorker<C> {
+    fn new(connector: C) -> Self {
         Self {
-            client: None,
-            data: None,
+            connector,
+            transport: None,
             is_enabled: false,
-            connect_retry_count: 0,
-            last_sent_end_timestamp: None,
             show_when_paused: false,
             display_mode: DiscordDisplayMode::Name,
             options: CardOptions::default(),
-            audio: None,
+            playback: None,
+            pending_audio: None,
+            header: None,
+            last_written: None,
+            rejected: None,
+            hold_until: None,
+            policy: SendPolicy::default(),
+            awaiting: VecDeque::new(),
+            next_connect_at: None,
+            nonce_counter: 0,
         }
     }
-}
 
-impl RpcWorker {
-    fn handle_message(&mut self, msg: RpcMessage) {
+    fn handle_message(&mut self, msg: RpcMessage, at: Stamp) {
         match msg {
             RpcMessage::Enable => {
                 info!("启用 Discord RPC");
                 self.is_enabled = true;
-                self.connect_retry_count = 0;
+                self.next_connect_at = None;
             }
             RpcMessage::Disable => {
                 info!("禁用 Discord RPC");
@@ -448,319 +593,394 @@ impl RpcWorker {
                     show_translation: payload.show_translation,
                     links: payload.links,
                 };
-
                 if let Some(mode) = payload.display_mode {
                     self.display_mode = mode;
                 }
-
-                if let Some(data) = &mut self.data {
-                    data.refresh_card(self.audio.as_ref(), &self.options);
-                }
-
-                self.last_sent_end_timestamp = None;
             }
-            RpcMessage::Metadata(payload) => {
-                let audio = self.audio.as_ref();
-                let new_data = match self.data.take() {
-                    Some(mut d) => {
-                        d.update_metadata(payload, audio, &self.options);
-                        d
-                    }
-                    None => ActivityData::from_metadata(payload, audio, &self.options),
-                };
-                self.data = Some(new_data);
-                self.last_sent_end_timestamp = None;
+            RpcMessage::Track(update) => self.handle_track(*update, at),
+            RpcMessage::AudioHeader(specs) => {
+                if specs.stream != 0 {
+                    self.header = Some(specs);
+                }
             }
             RpcMessage::AudioInfo(payload) => {
                 debug!(?payload, "更新音频规格");
-                self.audio = Some(payload);
-                // 只换第三行, 进度和封面都不动; 清掉防抖才能在同一首歌内刷新卡片
-                if let Some(data) = &mut self.data {
-                    let old_card = data.card.clone();
-                    data.refresh_card(self.audio.as_ref(), &self.options);
-                    if data.card != old_card {
-                        self.last_sent_end_timestamp = None;
+                match &mut self.playback {
+                    Some(playback) if playback.seq == payload.seq => {
+                        playback.audio = Some(payload);
+                        playback.audio_pending = false;
                     }
+                    Some(playback) if playback.seq > payload.seq => {}
+                    _ => self.pending_audio = Some(payload),
                 }
             }
             RpcMessage::PlayState(payload) => {
-                if let Some(data) = &mut self.data {
-                    if payload.status == PlaybackStatus::Playing
-                        && data.status != PlaybackStatus::Playing
-                    {
-                        self.last_sent_end_timestamp = None;
-                    }
-                    data.status = payload.status;
+                if let Some(playback) = &mut self.playback
+                    && playback.status != payload.status
+                {
+                    // 换状态时把位置定下来: 暂停后不再前进, 恢复后从这里继续
+                    playback.anchor = Anchor {
+                        position_ms: playback.position_at(at.mono),
+                        at,
+                    };
+                    playback.status = payload.status;
+                    self.hold_until = match payload.status {
+                        // 一首歌自然结束时会先报一次暂停, 紧接着就是下一首歌。
+                        // 等一小会儿再写, 免得为这个瞬间花掉一次写入, 让新歌多等一个间隔
+                        PlaybackStatus::Paused => Some(at.mono + PAUSE_SETTLE),
+                        PlaybackStatus::Playing => None,
+                    };
                 }
             }
             RpcMessage::Timeline(payload) => {
-                if let Some(data) = &mut self.data {
-                    data.current_time = payload.current_time;
+                let Some(playback) = &mut self.playback else {
+                    return;
+                };
+                if payload.seq != 0 && payload.seq != playback.seq {
+                    return;
+                }
+                if payload.total_time > 0.0 {
+                    playback.timeline_duration = Some(payload.total_time);
+                }
+
+                let moved = match payload.reason {
+                    TimelineReason::Seek => true,
+                    // 例行进度只在和预期对不上时才算数 (卡顿、没有上报的跳转)
+                    TimelineReason::Progress => {
+                        (payload.current_time - playback.position_at(at.mono)).abs()
+                            > DRIFT_TOLERANCE_MS
+                    }
+                };
+                if moved {
+                    debug!(
+                        seq = playback.seq,
+                        reason = ?payload.reason,
+                        position_ms = payload.current_time,
+                        "重新确定进度锚点"
+                    );
+                    playback.anchor = Anchor {
+                        position_ms: payload.current_time,
+                        at,
+                    };
                 }
             }
         }
+    }
+
+    fn handle_track(&mut self, update: TrackUpdate, at: Stamp) {
+        if let Some(playback) = &mut self.playback
+            && playback.seq == update.seq
+        {
+            // 同一次播放的补充 (例如封面地址变了): 进度和状态都不动
+            playback.metadata = update.metadata;
+            if update.audio.is_some() {
+                playback.audio = update.audio;
+            }
+            playback.audio_pending = update.audio_pending && playback.audio.is_none();
+            return;
+        }
+
+        let audio = update.audio.or_else(|| {
+            self.pending_audio
+                .take()
+                .filter(|audio| audio.seq == update.seq)
+        });
+        self.pending_audio = None;
+
+        // 从缓存文件头读到的规格通常紧跟着就到, 等它一下, 第一张卡片就是完整的。
+        // 快照到达时还处在暂停状态的话 (上一首歌刚自然结束), 按暂停的等待时间来
+        let settle = match update.status {
+            PlaybackStatus::Playing => TRACK_SETTLE,
+            PlaybackStatus::Paused => PAUSE_SETTLE,
+        };
+        self.hold_until = self.hold_until.max(Some(at.mono + settle));
+
+        debug!(
+            seq = update.seq,
+            stage = "track_received",
+            "收到新的曲目快照"
+        );
+        self.playback = Some(Playback {
+            seq: update.seq,
+            audio_pending: update.audio_pending && audio.is_none(),
+            audio,
+            metadata: update.metadata,
+            status: update.status,
+            anchor: Anchor {
+                position_ms: update.position_ms,
+                at,
+            },
+            timeline_duration: None,
+        });
+    }
+
+    fn desired(&self) -> Desired {
+        let Some(playback) = &self.playback else {
+            return Desired::Clear;
+        };
+        if playback.status == PlaybackStatus::Paused && !self.show_when_paused {
+            return Desired::Clear;
+        }
+
+        Desired::Card(Box::new(CardState {
+            card: build_card_with(
+                &playback.metadata,
+                self.audio_with_header(playback).as_ref(),
+                playback.audio_pending,
+                &self.options,
+            ),
+            display_mode: self.display_mode.clone(),
+            timestamps: playback.timestamps(),
+        }))
+    }
+
+    /// 规格里缺的采样率和位深, 用同一个音频流的文件头补上
+    fn audio_with_header(&self, playback: &Playback) -> Option<AudioInfoPayload> {
+        let mut audio = playback.audio.clone()?;
+        if let Some(header) = self.header
+            && header.stream == audio.stream
+        {
+            audio.sample_rate = audio.sample_rate.or(Some(header.sample_rate));
+            audio.bit_depth = audio.bit_depth.or(header.bit_depth);
+        }
+        Some(audio)
+    }
+
+    fn drop_connection(&mut self) {
+        self.transport = None;
+        self.last_written = None;
+        self.rejected = None;
+        self.awaiting.clear();
     }
 
     fn disconnect(&mut self) {
-        if let Some(mut client) = self.client.take() {
-            let _ = client.clear_activity();
-            let _ = client.close();
+        if let Some(mut transport) = self.transport.take() {
+            let nonce = self.next_nonce();
+            let _ = transport.write_frame(OP_FRAME, &activity_frame(&Desired::Clear, &nonce));
+            let _ = transport.write_frame(OP_CLOSE, &json!({}));
         }
-        self.last_sent_end_timestamp = None;
+        self.drop_connection();
     }
 
-    fn connect(&mut self) {
-        if self.connect_retry_count > 0 {
-            self.connect_retry_count -= 1;
-            return;
-        }
-
-        let mut client = DiscordIpcClient::new(APP_ID);
-        match client.connect() {
-            Ok(()) => {
-                info!("Discord IPC 已连接");
-                self.client = Some(client);
-                self.last_sent_end_timestamp = None;
-            }
-            Err(e) => {
-                info!("连接 Discord IPC 失败: {e:?}. Discord 可能未运行");
-                self.connect_retry_count = RECONNECT_COOLDOWN_SECONDS;
-            }
-        }
+    fn next_nonce(&mut self) -> String {
+        self.nonce_counter += 1;
+        format!("inflink-{}-{}", std::process::id(), self.nonce_counter)
     }
 
-    fn sync_discord(&mut self) {
-        if !self.is_enabled {
-            if self.client.is_some() {
-                self.disconnect();
-            }
+    /// 读走 Discord 的回复: 确认、拒绝、心跳和关闭
+    fn drain_replies(&mut self, now: Instant) {
+        let Some(transport) = &mut self.transport else {
             return;
-        }
-
-        if self.data.is_none() {
-            if let Some(client) = &mut self.client {
-                let _ = client.clear_activity();
-                self.last_sent_end_timestamp = None;
-            }
-            return;
-        }
-
-        if self.client.is_none() {
-            self.connect();
-        }
-
-        if let (Some(client), Some(data)) = (&mut self.client, &self.data) {
-            let success = Self::perform_update(
-                client,
-                data,
-                &mut self.last_sent_end_timestamp,
-                self.show_when_paused,
-                &self.display_mode,
-            );
-            if !success {
-                self.disconnect();
-            }
-        }
-    }
-
-    fn build_base_activity<'a>(
-        data: &'a ActivityData,
-        display_mode: &DiscordDisplayMode,
-    ) -> Activity<'a> {
-        let card = &data.card;
-
-        let mut assets = Assets::new()
-            .large_image(card.cover.as_str())
-            .small_image(NCM_SMALL_ICON_URL)
-            .small_text(card.app_name.as_str())
-            .small_url(NCM_HOME_URL);
-        // Listening 类型的卡片把 large_text 画成第三行, 它和封面共用 large_url
-        if let Some(third_line) = &card.third_line {
-            assets = assets.large_text(third_line.as_str());
-        }
-        if let Some(url) = &card.album_url {
-            assets = assets.large_url(url.as_str());
-        }
-
-        let buttons = vec![Button::new(
-            "🎧 Listen",
-            card.song_url.as_deref().unwrap_or(NCM_HOME_URL),
-        )];
-
-        let status_type = match display_mode {
-            DiscordDisplayMode::Name => StatusDisplayType::Name,
-            DiscordDisplayMode::State => StatusDisplayType::State,
-            DiscordDisplayMode::Details => StatusDisplayType::Details,
         };
 
-        let mut activity = Activity::new()
-            .name(card.app_name.as_str())
-            .details(card.details.as_str())
-            .state(card.state.as_str())
-            .activity_type(ActivityType::Listening)
-            .assets(assets)
-            .buttons(buttons)
-            .status_display_type(status_type);
-
-        if let Some(url) = &card.song_url {
-            activity = activity.details_url(url.as_str());
-        }
-        if let Some(url) = &card.artist_url {
-            activity = activity.state_url(url.as_str());
-        }
-
-        activity
-    }
-
-    fn calc_paused_timestamps(current_time: f64, duration: f64) -> (i64, i64) {
-        // 来自 https://musicpresence.app/ 的 hack，通过将
-        // 开始和结束时间戳向后平移一年以实现在暂停时进度静止的效果
-        const ONE_YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let current_progress_ms = current_time as i64;
-        let future_start = (now_ms - current_progress_ms) + ONE_YEAR_MS;
-        let future_end = future_start + (duration as i64);
-
-        (future_start, future_end)
-    }
-
-    fn calc_playing_timestamps(current_time: f64, duration: f64) -> (i64, i64) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let duration_ms = duration as i64;
-        let current_time_ms = current_time as i64;
-        let remaining_ms = (duration_ms - current_time_ms).max(0);
-
-        let end = now_ms + remaining_ms;
-        let start = end - duration_ms;
-
-        (start, end)
-    }
-
-    fn perform_update(
-        client: &mut DiscordIpcClient,
-        data: &ActivityData,
-        last_sent_end_timestamp: &mut Option<i64>,
-        show_when_paused: bool,
-        display_mode: &DiscordDisplayMode,
-    ) -> bool {
-        let mut activity = Self::build_base_activity(data, display_mode);
-        let mut new_end_timestamp = None;
-        let should_send;
-
-        match data.status {
-            PlaybackStatus::Paused => {
-                if !show_when_paused {
-                    debug!("播放暂停且配置为隐藏，清除 Activity");
-                    if let Err(e) = client.clear_activity() {
-                        warn!("清除 Discord Activity 失败: {e:?}");
-                        return false;
-                    }
-                    *last_sent_end_timestamp = None;
-                    return true;
-                }
-
-                if let Some(duration) = data.metadata.duration
-                    && duration > 0.0
-                {
-                    let (start, end) = Self::calc_paused_timestamps(data.current_time, duration);
-
-                    debug!(future_start = start, future_end = end, "应用 hack 时间戳");
-
-                    activity = activity.timestamps(Timestamps::new().start(start).end(end));
-                }
-
-                should_send = true;
-                *last_sent_end_timestamp = None;
+        let frames = match transport.read_frames() {
+            Ok(frames) => frames,
+            Err(e) => {
+                warn!("读取 Discord IPC 失败: {e}, 尝试重连");
+                self.drop_connection();
+                self.next_connect_at = Some(now);
+                return;
             }
-            PlaybackStatus::Playing => {
-                if let Some(duration) = data.metadata.duration
-                    && duration > 0.0
-                {
-                    let (start, end) = Self::calc_playing_timestamps(data.current_time, duration);
+        };
 
-                    // 频繁调用 Discord RPC 接口会导致限流，所以在跳转发生时再更新时间戳
-                    if let Some(last_end) = last_sent_end_timestamp {
-                        let diff = (*last_end - end).abs();
-                        if diff < TIMESTAMP_UPDATE_THRESHOLD_MS {
-                            return true;
-                        }
-                        debug!(
-                            diff_ms = diff,
-                            threshold_ms = TIMESTAMP_UPDATE_THRESHOLD_MS,
-                            "进度变更超过阈值，触发更新"
-                        );
-                    }
-
-                    activity = activity.timestamps(Timestamps::new().start(start).end(end));
-                    new_end_timestamp = Some(end);
-                    should_send = true;
-                } else {
-                    should_send = last_sent_end_timestamp.is_some();
-                    if should_send {
-                        warn!("没有时长，清除时间戳");
+        for (op, payload) in frames {
+            match op {
+                OP_PING => {
+                    if let Some(transport) = &mut self.transport {
+                        let _ = transport.write_frame(OP_PONG, &payload);
                     }
                 }
+                OP_CLOSE => {
+                    warn!(%payload, "Discord 关闭了 IPC 连接");
+                    self.drop_connection();
+                    self.next_connect_at = Some(now);
+                    return;
+                }
+                OP_FRAME => self.handle_reply(&payload, now),
+                _ => {}
             }
         }
 
-        if should_send {
-            debug!(
-                song = %data.metadata.song_name,
-                state = ?data.status,
-                "更新 Discord Activity"
+        while let Some(oldest) = self.awaiting.front() {
+            if now.saturating_duration_since(oldest.at) < REPLY_DEADLINE {
+                break;
+            }
+            warn!(seq = ?oldest.seq, "Discord 没有回复这次 Activity 更新");
+            self.awaiting.pop_front();
+        }
+    }
+
+    fn handle_reply(&mut self, payload: &Value, now: Instant) {
+        let Some(nonce) = payload.get("nonce").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(index) = self.awaiting.iter().position(|a| a.nonce == nonce) else {
+            return;
+        };
+        let Some(sent) = self.awaiting.remove(index) else {
+            return;
+        };
+        let waited_ms = now.saturating_duration_since(sent.at).as_millis();
+
+        if payload.get("evt").and_then(Value::as_str) == Some("ERROR") {
+            let code = payload.pointer("/data/code").and_then(Value::as_i64);
+            let message = payload
+                .pointer("/data/message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            warn!(
+                seq = ?sent.seq,
+                stage = "rpc_rejected",
+                ?code,
+                message,
+                waited_ms,
+                "Discord 拒绝了 Activity 更新"
             );
+            // Discord 还拿着之前的卡片, 但那是哪一张已经说不准了
+            if self.last_written.as_ref() == Some(&sent.desired) {
+                self.last_written = None;
+            }
+            self.rejected = Some(sent.desired);
+        } else {
+            debug!(seq = ?sent.seq, stage = "rpc_ack", waited_ms, "Discord 已接受 Activity 更新");
+        }
+    }
 
-            if let Err(e) = client.set_activity(activity) {
-                warn!("设置 Discord Activity 失败: {e:?}, 尝试重连");
-                return false;
+    /// 把现状同步给 Discord, 返回最迟多久之后需要再被调用一次
+    fn tick(&mut self, now: Instant) -> Duration {
+        if !self.is_enabled {
+            if self.transport.is_some() {
+                self.disconnect();
+            }
+            return IDLE_TICK;
+        }
+
+        self.drain_replies(now);
+        let desired = self.desired();
+
+        if self.transport.is_none() {
+            // 没有要显示的东西时不必连着 Discord
+            if desired == Desired::Clear {
+                return IDLE_TICK;
+            }
+            if let Some(retry_at) = self.next_connect_at
+                && now < retry_at
+            {
+                return retry_at.duration_since(now).min(IDLE_TICK);
+            }
+            match self.connector.connect(APP_ID) {
+                Ok(transport) => {
+                    info!("Discord IPC 已连接");
+                    self.transport = Some(transport);
+                    // 新连接上还没有设置过任何 Activity
+                    self.last_written = Some(Desired::Clear);
+                    self.next_connect_at = None;
+                    // 握手可能花了几百毫秒, 期间到达的消息还在队列里。
+                    // 先回去把它们处理完, 再按最新的状态写第一张卡片
+                    return Duration::ZERO;
+                }
+                Err(e) => {
+                    info!("连接 Discord IPC 失败: {e}. Discord 可能未运行");
+                    self.next_connect_at = Some(now + RECONNECT_DELAY);
+                    return IDLE_TICK;
+                }
             }
         }
 
-        if new_end_timestamp.is_some() {
-            *last_sent_end_timestamp = new_end_timestamp;
-        } else if matches!(data.status, PlaybackStatus::Playing) && data.metadata.duration.is_none()
+        if self.last_written.as_ref() == Some(&desired) || self.rejected.as_ref() == Some(&desired)
         {
-            *last_sent_end_timestamp = None;
+            return IDLE_TICK;
         }
 
-        true
+        if let Some(hold) = self.hold_until
+            && now < hold
+        {
+            return hold.duration_since(now);
+        }
+
+        let wait = self.policy.wait_for(now);
+        if !wait.is_zero() {
+            return wait.min(IDLE_TICK);
+        }
+
+        self.write(desired, now)
+    }
+
+    fn write(&mut self, desired: Desired, now: Instant) -> Duration {
+        let nonce = self.next_nonce();
+        let frame = activity_frame(&desired, &nonce);
+        let seq = self.playback.as_ref().map(|p| p.seq);
+        let Some(transport) = &mut self.transport else {
+            return IDLE_TICK;
+        };
+
+        if let Err(e) = transport.write_frame(OP_FRAME, &frame) {
+            warn!("设置 Discord Activity 失败: {e}, 尝试重连");
+            self.drop_connection();
+            // 刚才还好好的连接断了, 多半是 Discord 重启, 马上重连一次
+            self.next_connect_at = Some(now);
+            return RETRY_TICK;
+        }
+
+        match &desired {
+            Desired::Clear => debug!(?seq, stage = "rpc_write", "清除 Discord Activity"),
+            Desired::Card(state) => debug!(
+                ?seq,
+                stage = "rpc_write",
+                song = %state.card.details,
+                third_line = ?state.card.third_line,
+                "更新 Discord Activity"
+            ),
+        }
+
+        self.policy.record(now);
+        self.rejected = None;
+        self.awaiting.push_back(Awaiting {
+            nonce,
+            at: now,
+            seq,
+            desired: desired.clone(),
+        });
+        self.last_written = Some(desired);
+        IDLE_TICK
     }
 }
 
-impl Drop for RpcWorker {
+fn activity_frame(desired: &Desired, nonce: &str) -> Value {
+    let activity = match desired {
+        Desired::Clear => Value::Null,
+        Desired::Card(state) => serde_json::to_value(build_activity(state)).unwrap_or(Value::Null),
+    };
+    json!({
+        "cmd": "SET_ACTIVITY",
+        "args": { "pid": std::process::id(), "activity": activity },
+        "nonce": nonce,
+    })
+}
+
+impl<C: Connector> Drop for RpcWorker<C> {
     fn drop(&mut self) {
-        if let Some(mut client) = self.client.take() {
-            let _ = client.clear_activity();
-            let _ = client.close();
-        }
+        self.disconnect();
     }
 }
 
-fn background_loop(rx: &Receiver<RpcMessage>) {
-    let mut worker = RpcWorker::default();
+fn background_loop(rx: &Receiver<Envelope>) {
+    let mut worker = RpcWorker::new(PipeConnector);
+    let mut wait = IDLE_TICK;
 
     loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(msg) => {
-                worker.handle_message(msg);
-                worker.sync_discord();
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if worker.client.is_none() {
-                    worker.sync_discord();
+        match rx.recv_timeout(wait) {
+            Ok((msg, at)) => {
+                worker.handle_message(msg, at);
+                // 一起到达的消息先全部吃完再同步, 中间状态不值得写出去
+                while let Ok((msg, at)) = rx.try_recv() {
+                    worker.handle_message(msg, at);
                 }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        wait = worker.tick(Instant::now());
     }
 }
 
@@ -774,43 +994,53 @@ pub fn init() {
     });
 }
 
-fn send(msg: RpcMessage) {
+fn send(msg: RpcMessage, at: Stamp) {
     if let Ok(guard) = SENDER.lock()
         && let Some(tx) = guard.as_ref()
-        && let Err(e) = tx.send(msg)
+        && let Err(e) = tx.send((msg, at))
     {
         warn!("向 Discord RPC 线程发送消息失败: {e}");
     }
 }
 
 pub fn enable() {
-    send(RpcMessage::Enable);
+    send(RpcMessage::Enable, Stamp::now());
 }
 pub fn disable() {
-    send(RpcMessage::Disable);
+    send(RpcMessage::Disable, Stamp::now());
 }
 pub fn update_config(payload: DiscordConfigPayload) {
-    send(RpcMessage::Config(payload));
+    send(RpcMessage::Config(payload), Stamp::now());
 }
-pub fn update_metadata(payload: SharedMetadata) {
-    send(RpcMessage::Metadata(payload));
+pub fn update_track(payload: TrackUpdate, at: Stamp) {
+    send(RpcMessage::Track(Box::new(payload)), at);
 }
-pub fn update_play_state(payload: PlayStatePayload) {
-    send(RpcMessage::PlayState(payload));
+pub fn update_play_state(payload: PlayStatePayload, at: Stamp) {
+    send(RpcMessage::PlayState(payload), at);
 }
-pub fn update_timeline(payload: TimelinePayload) {
-    send(RpcMessage::Timeline(payload));
+pub fn update_timeline(payload: TimelinePayload, at: Stamp) {
+    send(RpcMessage::Timeline(payload), at);
 }
-pub fn update_audio_info(payload: AudioInfoPayload) {
-    send(RpcMessage::AudioInfo(payload));
+pub fn update_audio_info(payload: AudioInfoPayload, at: Stamp) {
+    send(RpcMessage::AudioInfo(payload), at);
+}
+pub fn update_audio_header(specs: AudioHeaderSpecs) {
+    send(RpcMessage::AudioHeader(specs), Stamp::now());
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        cell::RefCell,
+        io,
+        rc::Rc,
+    };
 
     use super::*;
-    use crate::model::ArtistPayload;
+    use crate::model::{
+        ArtistPayload,
+        CoverPayload,
+    };
 
     fn artist(name: &str, id: Option<u64>, trans_name: Option<&str>) -> ArtistPayload {
         ArtistPayload {
@@ -847,6 +1077,8 @@ mod tests {
         bit_depth: Option<u8>,
     ) -> AudioInfoPayload {
         AudioInfoPayload {
+            seq: 0,
+            stream: 0,
             ncm_id: 3_348_915_450,
             codec: codec.map(str::to_string),
             bitrate,
@@ -870,21 +1102,6 @@ mod tests {
 
     fn audio_options() -> CardOptions {
         third_line(DiscordThirdLine::Full)
-    }
-
-    /// 用户在设置里把第三行换成音质之后的 worker
-    fn audio_worker() -> RpcWorker {
-        let mut worker = RpcWorker::default();
-        worker.handle_message(RpcMessage::Config(DiscordConfigPayload {
-            show_when_paused: false,
-            display_mode: None,
-            app_name_mode: DiscordAppNameMode::Default,
-            third_line: DiscordThirdLine::Full,
-            artist_separator: DiscordArtistSeparator::Comma,
-            show_translation: false,
-            links: true,
-        }));
-        worker
     }
 
     fn links(card: Card) -> (Option<String>, Option<String>, Option<String>) {
@@ -1222,46 +1439,701 @@ mod tests {
     }
 
     #[test]
-    fn audio_info_refreshes_the_card_without_touching_progress() {
-        let mut worker = audio_worker();
-        worker.handle_message(RpcMessage::Metadata(SharedMetadata(Arc::new(metadata()))));
-        worker.handle_message(RpcMessage::PlayState(PlayStatePayload {
+    fn a_pending_quality_line_stays_empty_instead_of_showing_the_album() {
+        let line = |choice, pending| {
+            build_card_with(&metadata(), None, pending, &third_line(choice)).third_line
+        };
+        let album = "2026哔哩哔哩拜年纪";
+
+        for choice in [
+            DiscordThirdLine::Tier,
+            DiscordThirdLine::Full,
+            DiscordThirdLine::Compact,
+        ] {
+            assert_eq!(line(choice, true), None, "{choice:?}");
+            // 确定读不到规格时才退回专辑名
+            assert_eq!(line(choice, false).as_deref(), Some(album), "{choice:?}");
+        }
+        // 这两种写法本来就带着专辑名
+        assert_eq!(line(DiscordThirdLine::Album, true).as_deref(), Some(album));
+        assert_eq!(
+            line(DiscordThirdLine::TierAndAlbum, true).as_deref(),
+            Some(album)
+        );
+
+        // 本地歌曲和播客永远没有规格, 不存在 "还在路上"
+        let mut local = metadata();
+        local.kind = Some(SongKind::Local);
+        let card = build_card_with(&local, None, true, &audio_options());
+        assert_eq!(card.third_line.as_deref(), Some(album));
+    }
+
+    #[derive(Default)]
+    struct Pipe {
+        written: Vec<(u32, Value)>,
+        incoming: Vec<(u32, Value)>,
+        connects: usize,
+        refuse_connect: bool,
+        fail_writes: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeDiscord(Rc<RefCell<Pipe>>);
+
+    struct FakeTransport(Rc<RefCell<Pipe>>);
+
+    impl Transport for FakeTransport {
+        fn write_frame(&mut self, op: u32, payload: &Value) -> io::Result<()> {
+            let mut pipe = self.0.borrow_mut();
+            if pipe.fail_writes {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            pipe.written.push((op, payload.clone()));
+            Ok(())
+        }
+
+        fn read_frames(&mut self) -> io::Result<Vec<(u32, Value)>> {
+            Ok(std::mem::take(&mut self.0.borrow_mut().incoming))
+        }
+    }
+
+    impl Connector for FakeDiscord {
+        type Transport = FakeTransport;
+
+        fn connect(&mut self, _client_id: &str) -> io::Result<FakeTransport> {
+            let mut pipe = self.0.borrow_mut();
+            pipe.connects += 1;
+            if pipe.refuse_connect {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            Ok(FakeTransport(self.0.clone()))
+        }
+    }
+
+    const WALL_T0: i64 = 1_800_000_000_000;
+    const DURATION_MS: i64 = 258_586;
+    const ONE_YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+    /// 一个接着假 Discord 的 worker, 时间由测试自己推进 (单位毫秒)
+    struct Rig {
+        worker: RpcWorker<FakeDiscord>,
+        discord: FakeDiscord,
+        t0: Instant,
+    }
+
+    impl Rig {
+        fn new(third_line: DiscordThirdLine, show_when_paused: bool) -> Self {
+            let discord = FakeDiscord::default();
+            let mut rig = Self {
+                worker: RpcWorker::new(discord.clone()),
+                discord,
+                t0: Instant::now(),
+            };
+            rig.msg(0, RpcMessage::Enable);
+            rig.config(0, third_line, show_when_paused);
+            rig
+        }
+
+        fn config(&mut self, ms: u64, third_line: DiscordThirdLine, show_when_paused: bool) {
+            self.msg(
+                ms,
+                RpcMessage::Config(DiscordConfigPayload {
+                    show_when_paused,
+                    display_mode: None,
+                    app_name_mode: DiscordAppNameMode::Default,
+                    third_line,
+                    artist_separator: DiscordArtistSeparator::Comma,
+                    show_translation: false,
+                    links: true,
+                }),
+            );
+        }
+
+        fn stamp(&self, ms: u64) -> Stamp {
+            Stamp {
+                mono: self.t0 + Duration::from_millis(ms),
+                wall_ms: WALL_T0 + ms as i64,
+            }
+        }
+
+        fn msg(&mut self, ms: u64, msg: RpcMessage) {
+            let at = self.stamp(ms);
+            self.worker.handle_message(msg, at);
+        }
+
+        fn track(&mut self, ms: u64, update: TrackUpdate) {
+            self.msg(ms, RpcMessage::Track(Box::new(update)));
+        }
+
+        fn progress(&mut self, ms: u64, position_ms: f64) {
+            self.timeline(ms, position_ms, TimelineReason::Progress);
+        }
+
+        fn timeline(&mut self, ms: u64, position_ms: f64, reason: TimelineReason) {
+            self.msg(
+                ms,
+                RpcMessage::Timeline(TimelinePayload {
+                    current_time: position_ms,
+                    total_time: DURATION_MS as f64,
+                    seq: 0,
+                    reason,
+                }),
+            );
+        }
+
+        fn status(&mut self, ms: u64, status: PlaybackStatus) {
+            self.msg(ms, RpcMessage::PlayState(PlayStatePayload { status }));
+        }
+
+        fn tick(&mut self, ms: u64) -> Duration {
+            let now = self.stamp(ms).mono;
+            self.worker.tick(now)
+        }
+
+        /// 每 50 毫秒同步一次, 返回期间每次写入发生的时刻
+        fn run(&mut self, from_ms: u64, to_ms: u64) -> Vec<u64> {
+            let mut writes = Vec::new();
+            for ms in (from_ms..=to_ms).step_by(50) {
+                let before = self.activities().len();
+                self.tick(ms);
+                if self.activities().len() > before {
+                    writes.push(ms);
+                }
+            }
+            writes
+        }
+
+        /// 同上, 但每秒钟上报一次进度, 上报的位置带着真实客户端那样的抖动
+        fn play(&mut self, from_ms: u64, to_ms: u64, offset_ms: f64) -> Vec<u64> {
+            let mut writes = Vec::new();
+            for ms in (from_ms..=to_ms).step_by(50) {
+                if ms % 1000 == 0 {
+                    let jitter = if (ms / 1000) % 2 == 0 { 140.0 } else { -90.0 };
+                    self.progress(ms, ms as f64 + offset_ms + jitter);
+                }
+                writes.extend(self.run(ms, ms));
+            }
+            writes
+        }
+
+        /// 写给 Discord 的每一个 Activity, 清除时是 `null`
+        fn activities(&self) -> Vec<Value> {
+            self.discord
+                .0
+                .borrow()
+                .written
+                .iter()
+                .filter(|(op, frame)| *op == OP_FRAME && frame["cmd"] == "SET_ACTIVITY")
+                .map(|(_, frame)| frame["args"]["activity"].clone())
+                .collect()
+        }
+
+        fn last_nonce(&self) -> String {
+            let pipe = self.discord.0.borrow();
+            pipe.written.last().unwrap().1["nonce"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        fn reply(&self, frame: Value) {
+            self.discord.0.borrow_mut().incoming.push((OP_FRAME, frame));
+        }
+    }
+
+    fn song(seq: u64, name: &str) -> TrackUpdate {
+        let mut meta = metadata();
+        meta.song_name = name.to_string();
+        TrackUpdate {
+            seq,
+            metadata: meta,
+            audio: Some(AudioInfoPayload {
+                seq,
+                ..audio(Some("flac"), Some(1_596_360), Some(44_100), Some(24))
+            }),
+            audio_pending: false,
             status: PlaybackStatus::Playing,
-        }));
-        worker.handle_message(RpcMessage::Timeline(TimelinePayload {
-            current_time: 42_000.0,
-            total_time: 258_586.0,
-        }));
-        worker.last_sent_end_timestamp = Some(1);
+            position_ms: 0.0,
+        }
+    }
 
-        let spec = audio(Some("flac"), Some(1_869_617), None, None);
-        worker.handle_message(RpcMessage::AudioInfo(spec.clone()));
+    fn start(activity: &Value) -> i64 {
+        activity["timestamps"]["start"].as_i64().unwrap()
+    }
 
-        let data = worker.data.as_ref().unwrap();
-        assert_eq!(data.card.third_line.as_deref(), Some("FLAC, 1870 kbps"));
-        assert!((data.current_time - 42_000.0).abs() < f64::EPSILON);
-        assert_eq!(data.status, PlaybackStatus::Playing);
-        assert_eq!(worker.last_sent_end_timestamp, None);
-
-        // 同样的规格再来一次不应该打断防抖
-        worker.last_sent_end_timestamp = Some(1);
-        worker.handle_message(RpcMessage::AudioInfo(spec));
-        assert_eq!(worker.last_sent_end_timestamp, Some(1));
+    fn third(activity: &Value) -> Option<&str> {
+        activity["assets"]["large_text"].as_str()
     }
 
     #[test]
-    fn audio_info_that_arrives_before_metadata_is_kept() {
-        let mut worker = audio_worker();
-        worker.handle_message(RpcMessage::AudioInfo(audio(
-            Some("flac"),
-            Some(1_596_360),
-            Some(44_100),
-            None,
-        )));
-        worker.handle_message(RpcMessage::Metadata(SharedMetadata(Arc::new(metadata()))));
+    fn stable_playback_is_written_exactly_once() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+
+        let writes = rig.play(0, 60_000, 0.0);
+
+        assert_eq!(writes, [100]);
+        let activities = rig.activities();
+        assert_eq!(activities[0]["details"], "A");
+        assert_eq!(start(&activities[0]), WALL_T0);
         assert_eq!(
-            worker.data.as_ref().unwrap().card.third_line.as_deref(),
+            activities[0]["timestamps"]["end"].as_i64(),
+            Some(WALL_T0 + DURATION_MS)
+        );
+        assert_eq!(
+            third(&activities[0]),
+            Some("FLAC 24-bit/44.1 kHz, 1596 kbps")
+        );
+    }
+
+    #[test]
+    fn the_next_songs_audio_never_touches_the_card_on_screen() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.run(0, 200);
+
+        // B 的规格先到, B 的快照还没到
+        rig.msg(
+            5000,
+            RpcMessage::AudioInfo(AudioInfoPayload {
+                seq: 2,
+                ..audio(Some("mp3"), Some(320_000), Some(48_000), None)
+            }),
+        );
+        assert_eq!(rig.run(5000, 9000), [] as [u64; 0]);
+
+        let mut next = song(2, "B");
+        next.audio = None;
+        next.audio_pending = true;
+        rig.track(9000, next);
+        assert_eq!(rig.run(9000, 9500), [9100]);
+
+        let activities = rig.activities();
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[1]["details"], "B");
+        assert_eq!(third(&activities[1]), Some("MP3 48 kHz, 320 kbps"));
+    }
+
+    #[test]
+    fn late_quality_fills_in_once_without_moving_progress() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        let mut track = song(1, "A");
+        track.audio = None;
+        track.audio_pending = true;
+        rig.track(0, track);
+        rig.run(0, 200);
+
+        rig.msg(
+            300,
+            RpcMessage::AudioInfo(AudioInfoPayload {
+                seq: 1,
+                ..audio(Some("flac"), Some(1_596_360), Some(48_000), Some(24))
+            }),
+        );
+        let writes = rig.play(300, 30_000, 0.0);
+
+        assert_eq!(writes, [4100]);
+        let activities = rig.activities();
+        assert_eq!(third(&activities[0]), None);
+        assert_eq!(third(&activities[1]), Some("FLAC 24-bit/48 kHz, 1596 kbps"));
+        assert_eq!(activities[0]["timestamps"], activities[1]["timestamps"]);
+    }
+
+    #[test]
+    fn quality_that_arrives_within_the_settle_window_is_in_the_first_card() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        let mut track = song(1, "A");
+        track.audio = Some(AudioInfoPayload {
+            seq: 1,
+            ..audio(Some("flac"), Some(1_596_360), None, None)
+        });
+        rig.track(0, track);
+        // 文件头读到的采样率和位深
+        rig.msg(
+            30,
+            RpcMessage::AudioInfo(AudioInfoPayload {
+                seq: 1,
+                ..audio(Some("flac"), Some(1_596_360), Some(48_000), Some(24))
+            }),
+        );
+
+        assert_eq!(rig.run(0, 10_000), [100]);
+        assert_eq!(
+            third(&rig.activities()[0]),
+            Some("FLAC 24-bit/48 kHz, 1596 kbps")
+        );
+    }
+
+    #[test]
+    fn a_header_read_by_the_backend_completes_the_first_card_on_its_own() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        let mut track = song(1, "A");
+        // 从磁盘缓存恢复的条目: 没有采样率, 也没有位深
+        track.audio = Some(AudioInfoPayload {
+            seq: 1,
+            stream: 7,
+            ..audio(Some("flac"), Some(1_596_360), None, None)
+        });
+        rig.track(0, track);
+        rig.msg(
+            5,
+            RpcMessage::AudioHeader(AudioHeaderSpecs {
+                stream: 7,
+                sample_rate: 48_000,
+                bit_depth: Some(24),
+            }),
+        );
+
+        // 前端转一圈送回来的同一份规格晚了 600 毫秒, 内容相同, 不再写一次
+        rig.msg(
+            600,
+            RpcMessage::AudioInfo(AudioInfoPayload {
+                seq: 1,
+                stream: 7,
+                ..audio(Some("flac"), Some(1_596_360), Some(48_000), Some(24))
+            }),
+        );
+
+        assert_eq!(rig.play(0, 20_000, 0.0), [100]);
+        assert_eq!(
+            third(&rig.activities()[0]),
+            Some("FLAC 24-bit/48 kHz, 1596 kbps")
+        );
+    }
+
+    #[test]
+    fn a_header_for_another_stream_is_not_applied() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        let mut track = song(1, "A");
+        track.audio = Some(AudioInfoPayload {
+            seq: 1,
+            stream: 8,
+            ..audio(Some("flac"), Some(1_596_360), Some(44_100), None)
+        });
+        rig.track(0, track);
+        // 同一首歌上一个音质的文件头
+        rig.msg(
+            5,
+            RpcMessage::AudioHeader(AudioHeaderSpecs {
+                stream: 7,
+                sample_rate: 96_000,
+                bit_depth: Some(24),
+            }),
+        );
+
+        rig.run(0, 5000);
+        assert_eq!(
+            third(&rig.activities()[0]),
             Some("FLAC 44.1 kHz, 1596 kbps")
+        );
+    }
+
+    #[test]
+    fn paused_and_hidden_clears_once() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 10_000, 0.0);
+
+        rig.status(10_000, PlaybackStatus::Paused);
+        let mut writes = Vec::new();
+        for ms in (10_000..30_000).step_by(500) {
+            rig.status(ms, PlaybackStatus::Paused);
+            rig.progress(ms, 10_000.0);
+            writes.extend(rig.run(ms, ms + 450));
+        }
+
+        assert_eq!(writes, [10_800]);
+        assert_eq!(rig.activities()[1], Value::Null);
+    }
+
+    #[test]
+    fn paused_and_visible_writes_one_frozen_card() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, true);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 10_000, 0.0);
+
+        rig.status(10_000, PlaybackStatus::Paused);
+        let mut writes = Vec::new();
+        for ms in (10_000..30_000).step_by(500) {
+            rig.status(ms, PlaybackStatus::Paused);
+            rig.progress(ms, 10_000.0);
+            writes.extend(rig.run(ms, ms + 450));
+        }
+
+        assert_eq!(writes, [10_800]);
+        let paused = &rig.activities()[1];
+        assert_eq!(paused["details"], "A");
+        // 暂停在 10 秒处: 进度条冻结在那一刻
+        assert_eq!(start(paused), WALL_T0 + ONE_YEAR_MS);
+
+        // 恢复播放后从暂停的位置继续
+        rig.status(40_000, PlaybackStatus::Playing);
+        assert_eq!(rig.play(40_000, 50_000, -30_000.0), [40_000]);
+        assert_eq!(start(&rig.activities()[2]), WALL_T0 + 30_000);
+    }
+
+    #[test]
+    fn an_explicit_seek_is_written_however_short() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 10_000, 0.0);
+
+        // 往前跳 1 秒
+        rig.timeline(10_020, 11_020.0, TimelineReason::Seek);
+        let writes = rig.play(10_050, 30_000, 1000.0);
+
+        assert_eq!(writes, [10_050]);
+        let activities = rig.activities();
+        assert_eq!(start(&activities[1]), start(&activities[0]) - 1000);
+    }
+
+    #[test]
+    fn progress_noise_is_not_a_seek_but_a_real_jump_is() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 10_000, 0.0);
+
+        // 上报的位置比预期晚了 0.9 秒: 在容差之内
+        rig.progress(10_500, 9600.0);
+        assert_eq!(rig.run(10_500, 15_000), [] as [u64; 0]);
+
+        // 没有跳转事件, 但位置一下子差了 30 秒
+        rig.progress(16_000, 46_000.0);
+        assert_eq!(rig.play(16_050, 30_000, 30_000.0), [16_050]);
+        assert_eq!(start(&rig.activities()[1]), WALL_T0 - 30_000);
+    }
+
+    #[test]
+    fn a_song_without_a_duration_still_gets_its_first_card() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        let mut track = song(1, "A");
+        track.metadata.duration = None;
+        rig.track(0, track);
+
+        assert_eq!(rig.run(0, 3000), [100]);
+        let first = &rig.activities()[0];
+        assert_eq!(first["details"], "A");
+        assert!(first.get("timestamps").is_none());
+
+        // 时长随后跟着进度到达 (v2 客户端)
+        let writes = rig.play(3000, 20_000, 0.0);
+        assert_eq!(writes, [4100]);
+        assert_eq!(start(&rig.activities()[1]), WALL_T0);
+    }
+
+    #[test]
+    fn rapid_skipping_delivers_only_the_latest_song_one_spacing_later() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        let mut writes = rig.run(0, 950);
+        rig.track(1000, song(2, "B"));
+        writes.extend(rig.run(1000, 1950));
+        rig.track(2000, song(3, "C"));
+        writes.extend(rig.run(2000, 2950));
+        rig.track(3000, song(4, "D"));
+        writes.extend(rig.play(3000, 20_000, -3000.0));
+
+        assert_eq!(writes, [100, 4100]);
+        let activities = rig.activities();
+        assert_eq!(activities[0]["details"], "A");
+        assert_eq!(activities[1]["details"], "D");
+        assert_eq!(start(&activities[1]), WALL_T0 + 3000);
+    }
+
+    #[test]
+    fn a_song_ending_into_the_next_one_never_clears_the_card() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 200_000, 0.0);
+
+        rig.status(200_000, PlaybackStatus::Paused);
+        let mut writes = rig.run(200_000, 200_250);
+        let mut next = song(2, "B");
+        next.status = PlaybackStatus::Paused;
+        rig.track(200_300, next);
+        writes.extend(rig.run(200_300, 200_300));
+        rig.status(200_350, PlaybackStatus::Playing);
+        writes.extend(rig.run(200_350, 205_000));
+
+        assert_eq!(writes, [200_350]);
+        let activities = rig.activities();
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[1]["details"], "B");
+        assert_eq!(start(&activities[1]), WALL_T0 + 200_350);
+    }
+
+    #[test]
+    fn an_update_for_the_same_play_keeps_its_progress() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 30_000, 0.0);
+
+        let mut refreshed = song(1, "A");
+        refreshed.position_ms = 0.0;
+        refreshed.metadata.cover = Some(CoverPayload {
+            url: Some("http://p1.music.126.net/new.jpg".to_string()),
+        });
+        rig.track(30_000, refreshed);
+        assert_eq!(rig.play(30_050, 40_000, 0.0), [30_050]);
+
+        let activities = rig.activities();
+        assert_eq!(activities[0]["timestamps"], activities[1]["timestamps"]);
+        assert_ne!(
+            activities[0]["assets"]["large_image"],
+            activities[1]["assets"]["large_image"]
+        );
+    }
+
+    #[test]
+    fn a_rejected_card_is_not_resent_until_it_changes() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.run(0, 200);
+
+        rig.reply(json!({
+            "cmd": "SET_ACTIVITY",
+            "evt": "ERROR",
+            "nonce": rig.last_nonce(),
+            "data": { "code": 4000, "message": "child \"activity\" fails" },
+        }));
+        assert_eq!(rig.play(250, 20_000, 0.0), [] as [u64; 0]);
+        assert_eq!(rig.worker.last_written, None);
+
+        rig.config(20_000, DiscordThirdLine::Album, false);
+        assert_eq!(rig.run(20_000, 21_000), [20_000]);
+        assert_eq!(third(&rig.activities()[1]), Some("2026哔哩哔哩拜年纪"));
+    }
+
+    #[test]
+    fn an_accepted_card_is_matched_to_its_write() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.run(0, 200);
+        assert_eq!(rig.worker.awaiting.len(), 1);
+
+        // 别的回复不算数
+        rig.reply(json!({ "cmd": "SET_ACTIVITY", "evt": null, "nonce": "someone-else" }));
+        rig.tick(250);
+        assert_eq!(rig.worker.awaiting.len(), 1);
+
+        rig.reply(json!({ "cmd": "SET_ACTIVITY", "evt": null, "nonce": rig.last_nonce() }));
+        rig.tick(300);
+        assert!(rig.worker.awaiting.is_empty());
+        assert!(rig.worker.rejected.is_none());
+    }
+
+    #[test]
+    fn a_ping_is_answered() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.run(0, 200);
+
+        rig.discord
+            .0
+            .borrow_mut()
+            .incoming
+            .push((OP_PING, json!({ "beat": 7 })));
+        rig.tick(250);
+
+        let pipe = rig.discord.0.borrow();
+        assert_eq!(pipe.written.last(), Some(&(OP_PONG, json!({ "beat": 7 }))));
+    }
+
+    #[test]
+    fn a_broken_pipe_reconnects_at_once_and_restores_the_card() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.play(0, 10_000, 0.0);
+
+        rig.discord.0.borrow_mut().fail_writes = true;
+        rig.timeline(10_000, 60_000.0, TimelineReason::Seek);
+        rig.tick(10_000);
+        assert!(rig.worker.transport.is_none());
+
+        rig.discord.0.borrow_mut().fail_writes = false;
+        // 10.05 秒时重连, 下一次同步写出卡片
+        assert_eq!(rig.play(10_050, 20_000, 50_000.0), [10_100]);
+
+        assert_eq!(rig.discord.0.borrow().connects, 2);
+        let restored = &rig.activities()[1];
+        assert_eq!(restored["details"], "A");
+        assert_eq!(start(restored), WALL_T0 - 50_000);
+    }
+
+    #[test]
+    fn a_missing_discord_is_retried_by_the_clock_not_by_message_count() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.discord.0.borrow_mut().refuse_connect = true;
+        rig.track(0, song(1, "A"));
+
+        // 一阵密集的消息不会把重连的冷却提前耗尽
+        for ms in 0..200 {
+            rig.progress(ms * 10, (ms * 10) as f64);
+            rig.tick(ms * 10);
+        }
+        assert_eq!(rig.discord.0.borrow().connects, 1);
+
+        rig.tick(4900);
+        assert_eq!(rig.discord.0.borrow().connects, 1);
+        rig.tick(5000);
+        assert_eq!(rig.discord.0.borrow().connects, 2);
+
+        rig.discord.0.borrow_mut().refuse_connect = false;
+        assert_eq!(rig.run(5050, 11_000), [10_050]);
+        assert_eq!(rig.activities()[0]["details"], "A");
+    }
+
+    #[test]
+    fn what_arrives_during_the_handshake_is_in_the_first_card() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        let mut resumed = song(1, "A");
+        resumed.position_ms = 0.0;
+        rig.track(0, resumed);
+
+        // 连接发生在这次同步里; 握手期间用户跳到了 191 秒
+        rig.tick(100);
+        assert!(rig.activities().is_empty());
+        rig.timeline(120, 191_000.0, TimelineReason::Seek);
+
+        assert_eq!(rig.run(150, 10_000), [150]);
+        assert_eq!(start(&rig.activities()[0]), WALL_T0 + 120 - 191_000);
+    }
+
+    #[test]
+    fn nothing_to_show_means_no_connection_and_no_clears() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.run(0, 5000);
+        assert_eq!(rig.discord.0.borrow().connects, 0);
+
+        let mut paused = song(1, "A");
+        paused.status = PlaybackStatus::Paused;
+        rig.track(5000, paused);
+        rig.run(5000, 20_000);
+        assert_eq!(rig.discord.0.borrow().connects, 0);
+        assert!(rig.activities().is_empty());
+    }
+
+    #[test]
+    fn disabling_clears_and_closes() {
+        let mut rig = Rig::new(DiscordThirdLine::Full, false);
+        rig.track(0, song(1, "A"));
+        rig.run(0, 200);
+
+        rig.msg(1000, RpcMessage::Disable);
+        rig.tick(1000);
+
+        let pipe = rig.discord.0.borrow();
+        let last_two: Vec<u32> = pipe
+            .written
+            .iter()
+            .rev()
+            .take(2)
+            .map(|(op, _)| *op)
+            .collect();
+        assert_eq!(last_two, [OP_CLOSE, OP_FRAME]);
+        assert_eq!(
+            pipe.written[pipe.written.len() - 2].1["args"]["activity"],
+            Value::Null
         );
     }
 }

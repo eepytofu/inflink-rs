@@ -49,7 +49,6 @@ use windows::{
 
 use crate::{
     model::{
-        CoverPayload,
         MetadataPayload,
         PlaybackStatus,
         RepeatMode,
@@ -90,7 +89,34 @@ enum SmtcEvent {
     PreviousSong,
     ToggleShuffle,
     ToggleRepeat,
-    Seek { position_ms: f64 },
+    Seek {
+        position_ms: f64,
+    },
+    /// 不是 SMTC 的事件, 只是借用同一条回前端的通道
+    AudioHeader {
+        seq: u64,
+        ncm_id: u64,
+        md5: String,
+        sample_rate: u32,
+        bit_depth: Option<u8>,
+    },
+}
+
+/// 把从缓存文件头读到的规格送回前端
+pub fn emit_audio_header(
+    seq: u64,
+    ncm_id: u64,
+    md5: String,
+    sample_rate: u32,
+    bit_depth: Option<u8>,
+) {
+    dispatch_event(&SmtcEvent::AudioHeader {
+        seq,
+        ncm_id,
+        md5,
+        sample_rate,
+        bit_depth,
+    });
 }
 
 #[derive(Debug)]
@@ -166,9 +192,10 @@ pub fn unregister_event_callback() {
     }
 }
 
-#[instrument]
 fn dispatch_event(event: &SmtcEvent) {
-    debug!(?event, "分发 SMTC 事件");
+    if !matches!(event, SmtcEvent::AudioHeader { .. }) {
+        debug!(?event, "分发 SMTC 事件");
+    }
 
     let event_json = match serde_json::to_string(&event) {
         Ok(json) => json,
@@ -370,14 +397,31 @@ pub fn update_play_mode(
     Ok(())
 }
 
+/// 一次元数据发布时封面该怎么处理
+#[derive(Debug, Clone, Copy)]
+pub enum Cover<'a> {
+    /// 封面还没下载好, 先清空, 免得新歌的标题配着上一首歌的封面
+    Pending,
+    /// 封面到了。优先用字节, 没有字节或建流失败时退回 URL
+    Ready {
+        bytes: Option<&'a [u8]>,
+        url: Option<&'a str>,
+    },
+}
+
 /// 创建封面的流引用
 ///
 /// 优先使用前端通过 `ArrayBuffer` 通道直接送来的原始字节, 只有在没有字节、
 /// 或者用字节建流失败时, 才退回到封面 URL。
-fn create_cover_stream_ref(
-    cover: Option<&CoverPayload>,
-    cover_bytes: Option<&[u8]>,
-) -> Option<RandomAccessStreamReference> {
+fn create_cover_stream_ref(cover: Cover<'_>) -> Option<RandomAccessStreamReference> {
+    let Cover::Ready {
+        bytes: cover_bytes,
+        url,
+    } = cover
+    else {
+        return None;
+    };
+
     if let Some(bytes) = cover_bytes {
         debug!(
             bytes = bytes.len(),
@@ -389,12 +433,7 @@ fn create_cover_stream_ref(
         warn!("用二进制数据创建封面失败, 回退到封面 URL");
     }
 
-    let Some(payload) = cover else {
-        warn!("未提供封面, 将清空现有封面");
-        return None;
-    };
-
-    create_cover_from_url(payload.url.as_deref())
+    create_cover_from_url(url)
 }
 
 /// 把内存里的图片字节包装成 SMTC 可以消费的随机访问流
@@ -438,11 +477,11 @@ fn create_cover_from_url(url: Option<&str>) -> Option<RandomAccessStreamReferenc
     }
 }
 
-#[instrument(skip(cover_bytes))]
+#[instrument(skip(cover))]
 pub fn update_metadata(
     ctx: &SmtcContext,
     payload: &MetadataPayload,
-    cover_bytes: Option<&[u8]>,
+    cover: Cover<'_>,
 ) -> Result<()> {
     if !ctx.is_enabled {
         return Ok(());
@@ -456,7 +495,7 @@ pub fn update_metadata(
         "正在更新 SMTC 歌曲元数据"
     );
 
-    let thumbnail_stream_ref = create_cover_stream_ref(payload.cover.as_ref(), cover_bytes);
+    let thumbnail_stream_ref = create_cover_stream_ref(cover);
 
     let smtc = ctx.smtc();
     let updater = smtc.DisplayUpdater()?;
@@ -485,16 +524,14 @@ pub fn update_metadata(
     }
 
     updater.Update()?;
+    debug!(ncm_id = ?payload.ncm_id, has_cover = thumbnail_stream_ref.is_some(), "SMTC 元数据已发布");
     Ok(())
 }
 
+// 回调不在这里注销: 它同时也是音频文件头结果回前端的通道, 只开 Discord 时一样要用。
+// 关掉 SMTC 之后系统不会再派发按键事件, 留着回调没有副作用。
 pub fn set_enabled(ctx: &mut SmtcContext, enabled: bool) -> Result<()> {
     ctx.is_enabled = enabled;
     ctx.smtc.SetIsEnabled(enabled)?;
-
-    if !enabled {
-        unregister_event_callback();
-    }
-
     Ok(())
 }

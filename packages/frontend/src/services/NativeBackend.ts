@@ -1,18 +1,24 @@
 import type {
+	AudioHeaderRequest,
+	TimelineReason,
+	TrackSnapshot,
+} from "@/adapters/adapter";
+import type {
 	AudioInfo,
+	CoverInfo,
 	PlaybackStatus,
 	RepeatMode,
 	SongInfo,
+	TimelineInfo,
 } from "@/types/api";
 import type {
 	AppMessage,
+	AudioInfoPayload,
+	BackendEvent,
 	CommandResult,
-	ControlMessage,
 	DiscordConfigPayload,
 	LogEntry,
-	MetadataCoverPayload,
 	MetadataPayload,
-	SmtcEvent,
 } from "../types/backend";
 import type { LogLevel } from "../utils/logger";
 import logger from "../utils/logger";
@@ -51,7 +57,7 @@ function isLogLevel(level: string): level is LogLevel {
 
 class NativeBackend {
 	private isActive = false;
-	private updateGeneration = 0;
+	private coverGeneration = 0;
 
 	private call<K extends keyof NativeApiMap>(
 		func: K,
@@ -110,7 +116,7 @@ class NativeBackend {
 		}
 	}
 
-	public initialize(control_handler: (msg: ControlMessage) => void) {
+	public initialize(control_handler: (msg: BackendEvent) => void) {
 		if (this.isActive) return;
 		this.call("terminate");
 
@@ -128,7 +134,7 @@ class NativeBackend {
 
 		const eventCallback = (eventJson: string) => {
 			try {
-				const event: SmtcEvent = JSON.parse(eventJson);
+				const event: BackendEvent = JSON.parse(eventJson);
 				control_handler(event);
 			} catch (e) {
 				logger.error("解析后端事件失败:", "Native Bridge", e);
@@ -224,18 +230,50 @@ class NativeBackend {
 		logger.debug(`更新 Discord 配置`, "Native Bridge", config);
 	}
 
-	public async update(songInfo: SongInfo): Promise<void> {
-		this.updateGeneration++;
-		const generation = this.updateGeneration;
+	/**
+	 * 发送切歌快照：文字、规格、播放状态和进度一次给齐，不等封面
+	 */
+	public updateTrack(snapshot: TrackSnapshot) {
+		if (!this.isActive) return;
+		this.dispatch("UpdateTrack", {
+			seq: snapshot.seq,
+			metadata: this.toMetadataPayload(snapshot.song),
+			audio: snapshot.audio
+				? this.toAudioInfoPayload(
+						snapshot.seq,
+						snapshot.audioStream,
+						snapshot.audio,
+					)
+				: null,
+			audioPending: snapshot.audioPending,
+			status: snapshot.status,
+			positionMs: snapshot.positionMs,
+		});
+	}
+
+	/**
+	 * 封面下载好之后单独发给后端（只有 SMTC 用得上，Discord 自己按地址取图）
+	 *
+	 * 拿到封面字节时走 `dispatchWithArrayBuffer`：一次调用里同时交二进制和命令，
+	 * 后端读回字节后直接把它挂到这条命令上，二者不可能错配。
+	 * 没有字节（下载失败或超时）时退回普通 `dispatch`，封面交给后端按 URL 取。
+	 */
+	public async updateCover(
+		seq: number,
+		cover: CoverInfo | null,
+	): Promise<void> {
+		if (!this.isActive) return;
+		this.coverGeneration++;
+		const generation = this.coverGeneration;
 
 		let coverBytes: Uint8Array | undefined;
 
-		if (songInfo.cover?.blob) {
+		if (cover?.blob) {
 			try {
-				coverBytes = new Uint8Array(await songInfo.cover.blob.arrayBuffer());
+				coverBytes = new Uint8Array(await cover.blob.arrayBuffer());
 
-				// 等待期间可能有更新的更新插了进来, 这时候这次更新已经没有意义了
-				if (generation !== this.updateGeneration) return;
+				// 等待期间可能有更新的封面插了进来, 这时候这次更新已经没有意义了
+				if (generation !== this.coverGeneration || !this.isActive) return;
 			} catch (e) {
 				logger.warn(
 					`读取封面二进制数据失败: ${(e as Error).message}`,
@@ -244,59 +282,41 @@ class NativeBackend {
 			}
 		}
 
-		this.dispatchMetadata(songInfo, coverBytes);
-	}
-
-	/**
-	 * 发送元数据更新
-	 *
-	 * 拿到封面字节时走 `dispatchWithArrayBuffer`：一次调用里同时交二进制和命令，
-	 * 后端读回字节后直接把它挂到这条命令上，二者不可能错配。
-	 * 没有字节（或读取失败）时退回普通 `dispatch`，封面交给后端按 URL 取。
-	 */
-	private dispatchMetadata(
-		songInfo: SongInfo,
-		coverBytes: Uint8Array | undefined,
-	) {
-		const payload = this.toMetadataPayload(songInfo, {
-			url: songInfo.cover?.url,
-		});
+		const payload = { seq, url: cover?.url };
 
 		if (!coverBytes || coverBytes.byteLength === 0) {
-			this.dispatch("UpdateMetadata", payload);
+			// 既没有字节也没有地址：后端在切歌时已经把封面清空了，不用再发
+			if (payload.url) this.dispatch("UpdateCover", payload);
 			return;
 		}
 
-		// 与前一条 `dispatch` 完全相同的载荷，只是额外捎带一次二进制传输
-		const command = JSON.stringify({ type: "UpdateMetadata", payload });
+		const bytes = coverBytes;
+		const command = JSON.stringify({ type: "UpdateCover", payload });
 		const result = this.handleCommandResult(
-			"UpdateMetadata",
+			"UpdateCover",
 			this.call("dispatchWithArrayBuffer", [
 				command,
-				coverBytes.byteLength,
+				bytes.byteLength,
 				(target: ArrayBuffer) => {
-					new Uint8Array(target).set(coverBytes);
+					new Uint8Array(target).set(bytes);
 				},
 			]),
 		);
 
 		if (result?.status === "Success") {
 			logger.debug(
-				`封面二进制数据已随命令送达后端 (${coverBytes.byteLength} 字节)`,
+				`封面二进制数据已随命令送达后端 (${bytes.byteLength} 字节)`,
 				"Native Bridge",
 			);
 		}
 	}
 
-	private toMetadataPayload(
-		songInfo: SongInfo,
-		cover: MetadataCoverPayload | undefined,
-	): MetadataPayload {
+	private toMetadataPayload(songInfo: SongInfo): MetadataPayload {
 		return {
 			songName: songInfo.songName,
 			albumName: songInfo.albumName,
 			authorName: songInfo.authorName,
-			cover: cover?.url ? cover : null,
+			cover: songInfo.cover?.url ? { url: songInfo.cover.url } : null,
 			ncmId: songInfo.ncmId,
 			duration: songInfo.duration,
 			artists: songInfo.artists,
@@ -306,24 +326,49 @@ class NativeBackend {
 		};
 	}
 
-	public updateAudioInfo(info: AudioInfo) {
-		if (!this.isActive) return;
-		this.dispatch("UpdateAudioInfo", {
+	private toAudioInfoPayload(
+		seq: number,
+		stream: number,
+		info: AudioInfo,
+	): AudioInfoPayload {
+		return {
+			seq,
+			stream,
 			ncmId: info.ncmId,
 			codec: info.codec,
 			bitrate: info.bitrate,
 			sampleRate: info.sampleRate,
 			bitDepth: info.bitDepth,
 			level: info.level,
-		});
+		};
+	}
+
+	public updateAudioInfo(seq: number, stream: number, info: AudioInfo) {
+		if (!this.isActive) return;
+		this.dispatch(
+			"UpdateAudioInfo",
+			this.toAudioInfoPayload(seq, stream, info),
+		);
+	}
+
+	public probeAudioHeader(request: AudioHeaderRequest) {
+		if (!this.isActive) return;
+		this.dispatch("ProbeAudioHeader", request);
 	}
 
 	public updatePlayState(status: PlaybackStatus) {
 		this.dispatch("UpdatePlayState", { status });
 	}
 
-	public updateTimeline(timeline: { currentTime: number; totalTime: number }) {
-		this.dispatch("UpdateTimeline", timeline);
+	public updateTimeline(
+		timeline: TimelineInfo & { seq: number; reason: TimelineReason },
+	) {
+		this.dispatch("UpdateTimeline", {
+			currentTime: timeline.currentTime,
+			totalTime: timeline.totalTime,
+			seq: timeline.seq,
+			reason: timeline.reason,
+		});
 	}
 
 	public updatePlayMode(playMode: {
@@ -333,5 +378,4 @@ class NativeBackend {
 		this.dispatch("UpdatePlayMode", playMode);
 	}
 }
-
 export const NativeBackendInstance = new NativeBackend();

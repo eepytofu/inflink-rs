@@ -88,7 +88,10 @@ export namespace v3 {
 		sr?: number | null;
 		/** 实际下发的音质档位，可能低于请求的档位 */
 		level?: string | null;
+		/** 音频文件的 MD5，缓存文件名里带着它 */
 		md5?: string | null;
+		/** 时长，单位毫秒 */
+		time?: number | null;
 		url?: string | null;
 	}
 

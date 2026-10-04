@@ -1,4 +1,11 @@
-import type { INcmAdapter } from "@/adapters/adapter";
+import type {
+	AudioHeaderResult,
+	INcmAdapter,
+	InternalEventMap,
+	TimelineReason,
+	TrackCover,
+	TrackSnapshot,
+} from "@/adapters/adapter";
 import { PlayModeController } from "@/adapters/playModeController";
 import type {
 	AudioInfo,
@@ -14,9 +21,10 @@ import {
 	CoverManager,
 	type TypedEventListenerOrEventListenerObject,
 	TypedEventTarget,
-	throttle,
 } from "@/utils";
 import logger from "@/utils/logger";
+
+const TIMELINE_INTERVAL_MS = 1000;
 
 type AudioDataListener = TypedEventListenerOrEventListenerObject<
 	PlaybackEventMap,
@@ -34,6 +42,8 @@ export abstract class BaseNcmAdapter
 	protected isMuted = false;
 	protected resolutionSetting = "500";
 	protected audioInfo: AudioInfo | null = null;
+	/** `audioInfo` 描述的是哪一个音频流，0 表示没有编号 */
+	protected audioStream = 0;
 
 	protected readonly coverManager = new CoverManager();
 	protected readonly playModeController = new PlayModeController();
@@ -41,21 +51,16 @@ export abstract class BaseNcmAdapter
 	protected lastDispatchedSongId: string | number | null = null;
 	protected lastDispatchedCoverUrl: string | undefined = undefined;
 
-	protected readonly dispatchTimelineThrottled: () => void;
-	protected readonly resetTimelineThrottle: () => void;
+	public readonly internal = new TypedEventTarget<InternalEventMap>();
+	protected trackSeq = 0;
+	private currentSong: SongInfo | null = null;
+	private trackCover: TrackCover | null = null;
+	private lastTimelineDispatch = Number.NEGATIVE_INFINITY;
 
 	protected abstract onAudioDataSubscriptionStarted(): void;
 	protected abstract onAudioDataSubscriptionEnded(): void;
 
 	private audioDataListeners = new Set<AudioDataListener>();
-
-	constructor() {
-		super();
-		[this.dispatchTimelineThrottled, , this.resetTimelineThrottle] = throttle(
-			() => this.dispatchTimelineUpdateNow(),
-			1000,
-		);
-	}
 
 	public abstract initialize(): Promise<void>;
 	public abstract dispose(): void;
@@ -102,7 +107,58 @@ export abstract class BaseNcmAdapter
 		if (JSON.stringify(info) === JSON.stringify(this.audioInfo)) return;
 		this.audioInfo = info;
 		this.dispatch("audioInfoChange", info);
+		if (info) {
+			this.internal.dispatch("audioInfo", {
+				seq: this.trackSeq,
+				stream: this.audioStream,
+				info,
+			});
+		}
 	}
+
+	/**
+	 * 告诉后端这首歌确定读不到规格，音质行可以退回专辑名了
+	 */
+	protected reportAudioUnavailable(): void {
+		if (!this.currentSong) return;
+		this.internal.dispatch("audioInfo", {
+			seq: this.trackSeq,
+			stream: 0,
+			info: { ncmId: this.currentSong.ncmId },
+		});
+	}
+
+	/** 切到新歌时调用，此时 `trackSeq` 已经是新歌的序号 */
+	protected onTrackChanged(): void {}
+
+	/** 规格是否还在路上 */
+	protected isAudioPending(): boolean {
+		return false;
+	}
+
+	public getTrackSnapshot(): TrackSnapshot | null {
+		const song = this.currentSong;
+		if (!song) return null;
+
+		const audio = this.audioInfo?.ncmId === song.ncmId ? this.audioInfo : null;
+		return {
+			seq: this.trackSeq,
+			song,
+			audio,
+			audioStream: audio ? this.audioStream : 0,
+			audioPending: audio === null && this.isAudioPending(),
+			status: this.playState,
+			positionMs: this.musicPlayProgress,
+		};
+	}
+
+	public getTrackCover(): TrackCover | null {
+		return this.trackCover?.seq === this.trackSeq ? this.trackCover : null;
+	}
+
+	public resendPendingRequests(): void {}
+
+	public applyAudioHeader(_result: AudioHeaderResult): void {}
 
 	public setResolution(resolution: string): void {
 		this.resolutionSetting = resolution;
@@ -146,20 +202,40 @@ export abstract class BaseNcmAdapter
 			this.lastDispatchedSongId = currentSongInfo.ncmId;
 			this.lastDispatchedCoverUrl = currentCoverUrl;
 
+			this.currentSong = currentSongInfo;
+
 			if (isNewSong) {
+				this.trackSeq++;
+				this.trackCover = null;
 				this.musicPlayProgress = 0;
 				if (currentSongInfo.duration && currentSongInfo.duration > 0) {
 					this.musicDuration = currentSongInfo.duration;
 				} else {
 					this.musicDuration = 0;
 				}
+				this.onTrackChanged();
+			}
 
+			// 后端不等封面：文字、规格和进度现在就发，封面下载好了再单独补上
+			const snapshot = this.getTrackSnapshot();
+			if (snapshot) {
+				this.internal.dispatch("track", snapshot);
+			}
+
+			if (isNewSong) {
 				this.dispatchTimelineUpdateNow();
 			}
 
+			const seq = this.trackSeq;
 			this.coverManager
 				.getCover(currentSongInfo, this.resolutionSetting)
 				.then((result) => {
+					// 按播放序号认领：A→B→A 时，第一次 A 的封面不能贴到第二次 A 上
+					if (seq === this.trackSeq) {
+						this.trackCover = { seq, cover: result.cover };
+						this.internal.dispatch("cover", this.trackCover);
+					}
+
 					if (
 						String(result.songInfo.ncmId) === String(this.lastDispatchedSongId)
 					) {
@@ -212,13 +288,40 @@ export abstract class BaseNcmAdapter
 			totalTime: this.musicDuration,
 		});
 
-		this.dispatchTimelineThrottled();
+		// 用时间戳而不是定时器来限流：窗口最小化时定时器会被大幅推迟，
+		// 靠定时器解除限流的话进度更新会跟着卡住
+		if (performance.now() - this.lastTimelineDispatch >= TIMELINE_INTERVAL_MS) {
+			this.dispatchTimelineUpdateNow();
+		}
+	}
+
+	protected resetTimelineThrottle(): void {
+		this.lastTimelineDispatch = Number.NEGATIVE_INFINITY;
 	}
 
 	protected dispatchTimelineUpdateNow(): void {
+		this.lastTimelineDispatch = performance.now();
 		this.dispatch("timelineUpdate", {
 			currentTime: this.musicPlayProgress,
 			totalTime: this.musicDuration,
+		});
+		this.dispatchInternalTimeline("progress");
+	}
+
+	/**
+	 * 用户主动跳转。公开的 `timelineUpdate` 不在这里派发（紧随其后的进度事件
+	 * 会派发），但后端需要知道这是一次跳转，哪怕只跳了一点点
+	 */
+	protected dispatchSeek(): void {
+		this.dispatchInternalTimeline("seek");
+	}
+
+	private dispatchInternalTimeline(reason: TimelineReason): void {
+		this.internal.dispatch("timeline", {
+			seq: this.trackSeq,
+			currentTime: this.musicPlayProgress,
+			totalTime: this.musicDuration,
+			reason,
 		});
 	}
 

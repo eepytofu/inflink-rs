@@ -1,7 +1,10 @@
 use std::{
     fmt,
-    ops::Deref,
-    sync::Arc,
+    time::{
+        Instant,
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use serde::{
@@ -9,28 +12,36 @@ use serde::{
     Serialize,
 };
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SharedMetadata(pub Arc<MetadataPayload>);
-
-impl Deref for SharedMetadata {
-    type Target = MetadataPayload;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+/// 一条消息被观察到的时刻
+///
+/// 在渲染线程收到命令时就取, 而不是等后台线程处理到它时再取: 进度锚点要的是
+/// "这个位置是什么时候的位置", 排队等待的时间不能算进去。
+#[derive(Debug, Clone, Copy)]
+pub struct Stamp {
+    pub mono: Instant,
+    /// Unix 毫秒
+    pub wall_ms: i64,
 }
 
-impl AsRef<MetadataPayload> for SharedMetadata {
-    fn as_ref(&self) -> &MetadataPayload {
-        &self.0
+impl Stamp {
+    pub fn now() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        }
     }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum AppMessage {
-    UpdateMetadata(MetadataUpdate),
+    UpdateTrack(Box<TrackUpdate>),
+    UpdateCover(CoverUpdate),
     UpdateAudioInfo(AudioInfoPayload),
+    ProbeAudioHeader(AudioHeaderRequest),
 
     UpdatePlayState(PlayStatePayload),
     UpdateTimeline(TimelinePayload),
@@ -97,6 +108,12 @@ pub struct MetadataPayload {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioInfoPayload {
+    /// 这份规格属于哪一次播放, 见 [`TrackUpdate::seq`]
+    #[serde(default)]
+    pub seq: u64,
+    /// 这份规格描述的是哪一个音频流, 见 [`AudioHeaderRequest::stream`]
+    #[serde(default)]
+    pub stream: u64,
     /// 这份规格属于哪首歌, 与当前元数据的 `ncm_id` 不一致时不展示
     pub ncm_id: u64,
     #[serde(default)]
@@ -114,28 +131,85 @@ pub struct AudioInfoPayload {
     pub level: Option<String>,
 }
 
-/// 一次元数据更新命令
+/// 切歌瞬间的完整快照
 ///
-/// 除了前端送来的元数据, 它还带着封面二进制数据: 前端用
-/// `inflink.dispatchWithArrayBuffer` 在同一次调用里把字节和命令一起交过来,
-/// `dispatcher::send_command` 会把字节挂到这个字段上 (详见 `array_buffer` 模块),
-/// 让它跟着命令一起跨线程送到 dispatcher。
-#[derive(Deserialize, Serialize, Clone, PartialEq)]
-pub struct MetadataUpdate {
-    #[serde(flatten)]
-    pub payload: MetadataPayload,
+/// 文字、规格、播放状态和进度在同一条命令里到达, 不等封面, 这样卡片不会出现
+/// "新歌的进度配旧歌的标题" 这类中间状态。
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackUpdate {
+    /// 前端每换一首歌就加一。A→B→A 里的两次 A 序号不同, 歌曲 ID 做不到这一点
+    pub seq: u64,
+    pub metadata: MetadataPayload,
+    #[serde(default)]
+    pub audio: Option<AudioInfoPayload>,
+    /// 规格还在路上。此时音质行留空, 而不是先拿专辑名顶替
+    #[serde(default)]
+    pub audio_pending: bool,
+    pub status: PlaybackStatus,
+    #[serde(default)]
+    pub position_ms: f64,
+}
+
+/// 封面下载完成后单独送来, 只给 SMTC 用 (Discord 自己按 URL 取图)
+///
+/// 字节由前端用 `inflink.dispatchWithArrayBuffer` 在同一次调用里交过来,
+/// `dispatcher::send_command` 会把它挂到 `cover_bytes` 上 (详见 `array_buffer` 模块)。
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct CoverUpdate {
+    pub seq: u64,
+    /// 没有字节 (下载失败或超时) 时, 后端直接按这个地址取图
+    #[serde(default)]
+    pub url: Option<String>,
 
     /// 封面原始字节, 只由后端内部填充, 前端不会传
     #[serde(default, skip_serializing)]
     pub cover_bytes: Option<Vec<u8>>,
 }
 
-impl fmt::Debug for MetadataUpdate {
+impl fmt::Debug for CoverUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MetadataUpdate")
-            .field("payload", &self.payload)
+        f.debug_struct("CoverUpdate")
+            .field("seq", &self.seq)
+            .field("url", &self.url)
             .field("cover_bytes", &self.cover_bytes.as_ref().map(Vec::len))
             .finish()
+    }
+}
+
+/// 从缓存文件头读到的规格
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioHeaderSpecs {
+    pub stream: u64,
+    pub sample_rate: u32,
+    pub bit_depth: Option<u8>,
+}
+
+/// 请求从网易云的缓存文件头读取采样率和位深
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioHeaderRequest {
+    pub seq: u64,
+    /// 前端给每个音频流 (歌曲加 MD5) 编的号, 同一首歌换音质时会变。
+    /// 读到的结果凭它认领对应的那份规格, 0 表示没有编号
+    #[serde(default)]
+    pub stream: u64,
+    pub ncm_id: u64,
+    /// 音频流的 MD5, 缓存文件名里带着它, 用来认准是哪一个文件
+    pub md5: String,
+    #[serde(default)]
+    pub duration_ms: Option<f64>,
+}
+
+impl fmt::Debug for AudioHeaderRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // MD5 不进日志
+        f.debug_struct("AudioHeaderRequest")
+            .field("seq", &self.seq)
+            .field("stream", &self.stream)
+            .field("ncm_id", &self.ncm_id)
+            .field("duration_ms", &self.duration_ms)
+            .finish_non_exhaustive()
     }
 }
 
@@ -163,6 +237,20 @@ pub struct PlayStatePayload {
 pub struct TimelinePayload {
     pub current_time: f64,
     pub total_time: f64,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub reason: TimelineReason,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TimelineReason {
+    /// 播放器例行上报的进度
+    #[default]
+    Progress,
+    /// 用户主动跳转, 哪怕只跳了一点点也要反映出来
+    Seek,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

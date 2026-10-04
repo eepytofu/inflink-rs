@@ -598,6 +598,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 		if (!this.isProgressForCurrentTrack(e.detail.playId)) return;
 		this.musicPlayProgress = e.detail.currentMs;
 		this.resetTimelineThrottle();
+		this.dispatchSeek();
 	};
 
 	private readonly onVolumeChanged = (

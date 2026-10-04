@@ -29,6 +29,19 @@ export type SmtcEvent =
 	| { type: "ToggleRepeat" }
 	| { type: "Seek"; position_ms: number };
 
+/** 后端从缓存文件头读到的音频规格 */
+export interface AudioHeaderEvent {
+	type: "AudioHeader";
+	seq: number;
+	ncm_id: number;
+	md5: string;
+	sample_rate: number;
+	bit_depth: number | null;
+}
+
+/** 后端经事件回调送回前端的所有消息 */
+export type BackendEvent = SmtcEvent | AudioHeaderEvent;
+
 /**
  * FFI 边界使用的元数据类型
  */
@@ -52,6 +65,8 @@ export interface MetadataArtistPayload {
 }
 
 export interface AudioInfoPayload {
+	seq: number;
+	stream: number;
 	ncmId: number;
 	codec?: string | undefined;
 	bitrate?: number | undefined;
@@ -70,14 +85,40 @@ export interface PlayStatePayload {
 export interface TimelinePayload {
 	currentTime: number;
 	totalTime: number;
+	seq: number;
+	reason: "progress" | "seek";
+}
+
+export interface TrackPayload {
+	seq: number;
+	metadata: MetadataPayload;
+	audio: AudioInfoPayload | null;
+	audioPending: boolean;
+	status: PlaybackStatus;
+	positionMs: number;
+}
+
+export interface CoverUpdatePayload {
+	seq: number;
+	url?: string | undefined;
+}
+
+export interface AudioHeaderRequestPayload {
+	seq: number;
+	stream: number;
+	ncmId: number;
+	md5: string;
+	durationMs?: number | undefined;
 }
 
 export interface PlayModePayload extends PlayMode {}
 export interface VolumePayload extends VolumeInfo {}
 
 export type AppMessage = {
-	UpdateMetadata: MetadataPayload;
+	UpdateTrack: TrackPayload;
+	UpdateCover: CoverUpdatePayload;
 	UpdateAudioInfo: AudioInfoPayload;
+	ProbeAudioHeader: AudioHeaderRequestPayload;
 	UpdatePlayState: PlayStatePayload;
 	UpdateTimeline: TimelinePayload;
 	UpdatePlayMode: PlayModePayload;

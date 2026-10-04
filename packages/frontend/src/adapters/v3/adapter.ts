@@ -16,6 +16,7 @@ import {
 	waitForElement,
 } from "@/utils";
 import logger from "@/utils/logger";
+import type { AudioHeaderResult } from "../adapter";
 import { BaseNcmAdapter } from "../baseAdapter";
 import { firstNonEmpty, parseCatalogId, toArtistInfos } from "../metadata";
 import { type AudioPlayer, AudioPlayerWrapper } from "./audioPlayerWrapper";
@@ -227,16 +228,62 @@ function positiveInteger(value: unknown): number | undefined {
 		: undefined;
 }
 
-function toAudioInfo(ncmId: number, stream: v3.StreamInfo): AudioInfo {
+/** 从缓存文件头读到的规格 */
+interface HeaderSpecs {
+	sampleRate: number;
+	bitDepth?: number | undefined;
+}
+
+interface HeaderProbe {
+	key: string;
+	/** 这个音频流的编号 */
+	stream: number;
+	ncmId: number;
+	md5: string;
+	durationMs: number | undefined;
+	/** 已经请求过几次 */
+	attempts: number;
+}
+
+/** 音频地址请求还没回来时，在这次播放的前几个进度事件里重读 */
+const STREAM_INFO_RETRIES = 5;
+/**
+ * 缓存文件头还没写好时，播放到这些位置再各试一次，然后放弃
+ *
+ * 由进度事件驱动，不用定时器，暂停时自然不会重试
+ */
+const HEADER_RETRY_AT_MS = [1000, 3000, 8000];
+const HEADER_CACHE_LIMIT = 64;
+
+function streamMd5(stream: v3.StreamInfo): string | null {
+	return typeof stream.md5 === "string" && /^[0-9a-f]{32}$/i.test(stream.md5)
+		? stream.md5.toLowerCase()
+		: null;
+}
+
+function toAudioInfo(
+	ncmId: number,
+	stream: v3.StreamInfo,
+	header: HeaderSpecs | undefined,
+): AudioInfo {
 	const codec =
 		typeof stream.type === "string" && stream.type.trim() !== ""
 			? stream.type.trim().toLowerCase()
 			: undefined;
+	const streamRate = positiveInteger(stream.sr);
+	if (streamRate && header && streamRate !== header.sampleRate) {
+		logger.warn(
+			`文件头的采样率 (${header.sampleRate}) 与音频流信息 (${streamRate}) 不一致`,
+			"Adapter V3",
+		);
+	}
 	return {
 		ncmId,
 		codec,
 		bitrate: positiveInteger(stream.br),
-		sampleRate: positiveInteger(stream.sr),
+		// 网易云把音频流信息存进磁盘缓存时会丢掉采样率，这时用文件头里的补上
+		sampleRate: streamRate ?? header?.sampleRate,
+		bitDepth: header?.bitDepth,
 		level:
 			typeof stream.level === "string" && stream.level !== ""
 				? stream.level
@@ -269,7 +316,10 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 	private webpackRequire: WebpackRequire | null = null;
 	private streamCache: StreamCacheGetter | null = null;
 	private lastAudioInfoKey: string | null = null;
-	private pendingAudioInfoPlayId: string | null = null;
+	private streamInfoRetries = 0;
+	private headerProbe: HeaderProbe | null = null;
+	private streamCounter = 0;
+	private readonly headerCache = new Map<string, HeaderSpecs>();
 
 	public async initialize(): Promise<void> {
 		const require = await getWebpackRequire();
@@ -594,30 +644,118 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 	/**
 	 * 从网易云留在内存里的音频流信息读取当前歌曲的真实规格
 	 *
-	 * 只在 playId 或音质档位变化时读一次，不轮询、不发请求。条目必须属于当前
+	 * 只在切歌、playId 或音质档位变化时读，不轮询、不发请求。条目必须属于当前
 	 * 歌曲才会采用，否则预加载的下一首歌或者上一首歌的规格会被错当成当前的。
 	 */
 	private refreshAudioInfo(): void {
 		const playingInfo = this.reduxStore?.getState().playing;
 		const trackId = playingInfo ? resolveTrackId(playingInfo) : null;
 		if (!playingInfo || !trackId || playingInfo.resourceType === "voice") {
-			this.pendingAudioInfoPlayId = null;
+			this.streamInfoRetries = 0;
+			this.headerProbe = null;
 			this.updateAudioInfo(null);
 			return;
 		}
 
 		const stream = this.findStreamInfo(String(trackId));
 		if (!stream) {
-			// 地址请求可能还没回来，等这次播放的第一个进度事件再读一次
-			this.pendingAudioInfoPlayId = playingInfo.playId ?? null;
+			// 地址请求可能还没回来，之后的进度事件会再读
 			if (this.audioInfo?.ncmId !== trackId) {
 				this.updateAudioInfo(null);
 			}
 			return;
 		}
 
-		this.pendingAudioInfoPlayId = null;
-		this.updateAudioInfo(toAudioInfo(trackId, stream));
+		this.streamInfoRetries = 0;
+
+		// 同一首歌的不同音质是不同的文件，所以按 MD5 认文件，而不是按歌曲 ID
+		const md5 = streamMd5(stream);
+		const key = md5 ? `${trackId}|${md5}` : null;
+		const header = key ? this.headerCache.get(key) : undefined;
+
+		if (this.headerProbe?.key !== key) {
+			this.headerProbe =
+				key && md5 && playingInfo.trackFileType !== "local"
+					? {
+							key,
+							stream: ++this.streamCounter,
+							ncmId: trackId,
+							md5,
+							durationMs: positiveInteger(stream.time),
+							attempts: 0,
+						}
+					: null;
+		}
+
+		this.audioStream = this.headerProbe?.stream ?? 0;
+		this.updateAudioInfo(toAudioInfo(trackId, stream, header));
+
+		if (this.headerProbe && this.headerProbe.attempts === 0 && !header) {
+			this.requestAudioHeader();
+		}
+	}
+
+	private requestAudioHeader(): void {
+		const probe = this.headerProbe;
+		if (!probe) return;
+		probe.attempts++;
+		this.internal.dispatch("audioHeaderRequest", {
+			seq: this.trackSeq,
+			stream: probe.stream,
+			ncmId: probe.ncmId,
+			md5: probe.md5,
+			durationMs: probe.durationMs,
+		});
+	}
+
+	private retryAudioHeader(currentMs: number): void {
+		const probe = this.headerProbe;
+		if (!probe || this.headerCache.has(probe.key)) return;
+		const dueAt = HEADER_RETRY_AT_MS[probe.attempts - 1];
+		if (dueAt !== undefined && currentMs >= dueAt) {
+			this.requestAudioHeader();
+		}
+	}
+
+	public override resendPendingRequests(): void {
+		const probe = this.headerProbe;
+		if (probe && !this.headerCache.has(probe.key)) {
+			probe.attempts = 0;
+			this.requestAudioHeader();
+		}
+	}
+
+	public override applyAudioHeader(result: AudioHeaderResult): void {
+		const key = `${result.ncmId}|${result.md5.toLowerCase()}`;
+		if (this.headerCache.size >= HEADER_CACHE_LIMIT) {
+			const oldest = this.headerCache.keys().next().value;
+			if (oldest !== undefined) this.headerCache.delete(oldest);
+		}
+		this.headerCache.set(key, {
+			sampleRate: result.sampleRate,
+			bitDepth: result.bitDepth,
+		});
+
+		// 结果可能属于已经切走的歌，留在缓存里等下次播放它时直接用
+		if (this.headerProbe?.key === key) {
+			this.refreshAudioInfo();
+		}
+	}
+
+	protected override onTrackChanged(): void {
+		this.lastAudioInfoKey = this.currentAudioInfoKey();
+		this.streamInfoRetries = STREAM_INFO_RETRIES;
+		this.refreshAudioInfo();
+	}
+
+	protected override isAudioPending(): boolean {
+		return this.streamInfoRetries > 0;
+	}
+
+	// playId 每次加载音频都会变，音质档位在同一首歌内切换音质时会变
+	private currentAudioInfoKey(): string {
+		const playingInfo = this.reduxStore?.getState().playing;
+		return `${playingInfo?.resourceTrackId ?? ""}|${playingInfo?.playId ?? ""}|${playingInfo?.resourcePlayingQuality ?? ""}`;
 	}
 
 	private findStreamInfo(trackId: string): v3.StreamInfo | null {
@@ -737,8 +875,7 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 			}
 		}
 
-		// playId 每次加载音频都会变，音质档位在同一首歌内切换音质时会变
-		const audioInfoKey = `${playingInfo.resourceTrackId ?? ""}|${playingInfo.playId ?? ""}|${playingInfo.resourcePlayingQuality ?? ""}`;
+		const audioInfoKey = this.currentAudioInfoKey();
 		if (audioInfoKey !== this.lastAudioInfoKey) {
 			this.lastAudioInfoKey = audioInfoKey;
 			this.refreshAudioInfo();
@@ -823,13 +960,15 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 	): void => {
 		if (!this.isProgressForCurrentTrack(e.detail.playId)) return;
 
-		if (
-			this.pendingAudioInfoPlayId !== null &&
-			this.pendingAudioInfoPlayId === e.detail.playId
-		) {
+		if (this.streamInfoRetries > 0) {
+			this.streamInfoRetries--;
 			this.refreshAudioInfo();
-			// 这次还读不到就不再重试，等下一次 playId 或音质变化
-			this.pendingAudioInfoPlayId = null;
+			if (this.streamInfoRetries === 0 && !this.getCurrentAudioInfo()) {
+				// 重试用完了还是读不到，等下一次 playId 或音质变化
+				this.reportAudioUnavailable();
+			}
+		} else {
+			this.retryAudioHeader(e.detail.currentMs);
 		}
 
 		if (this.ignoreNextZeroProgressEvent && e.detail.currentMs === 0) {
@@ -850,6 +989,7 @@ export class V3NcmAdapter extends BaseNcmAdapter {
 		this.resetTimelineThrottle();
 		// 跳转同时也会触发progress事件，所以在这里就不派发更新了
 		// this.dispatchTimelineUpdateNow();
+		this.dispatchSeek();
 	};
 
 	private readonly onPlayStateChanged = (

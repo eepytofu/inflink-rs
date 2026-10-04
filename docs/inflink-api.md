@@ -115,10 +115,12 @@ api.removeEventListener("timelineUpdate", onTimelineUpdate);
 | `bitDepth`   | `number \| undefined` | 位深                                             |
 | `level`      | `string \| undefined` | 网易云实际下发的音质档位，例如 `lossless`、`hires` |
 
-这些值来自网易云实际下发的音频流信息，而不是音质档位的宣传参数，所以拿不到的字段不会出现：
+这些值来自网易云实际下发的音频流信息和缓存下来的音频文件本身，而不是音质档位的宣传参数，所以拿不到的字段不会出现：
 
-- 网易云不提供位深，`bitDepth` 目前始终不存在。
-- 从磁盘缓存恢复的歌曲没有 `sampleRate`。
+- `bitDepth` 读自缓存的 FLAC 文件头，所以只有 FLAC 才有；MP3、AAC 这类有损格式没有位深这个概念。
+- 网易云从磁盘缓存恢复的音频流信息不带采样率，这时 `sampleRate` 同样读自缓存文件头。
+- 文件头比音频流信息晚一点读到：`audioInfoChange` 可能先带着不完整的规格触发一次，读到之后再触发一次。
+- 没有缓存文件（下载的歌曲、本地文件、缓存目录被改到别处）时，这两个字段可能不存在。
 - `level` 是实际下发的档位，可能低于用户选择的档位。
 
 ### `getTimeline(): TimelineInfo | null`
