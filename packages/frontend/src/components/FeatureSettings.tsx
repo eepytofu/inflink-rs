@@ -321,6 +321,8 @@ export function FeatureSettings() {
 						value={toThirdLine(thirdLine)}
 						onChange={(val) => setThirdLine(val as DiscordThirdLine)}
 						editable={false}
+						// 选项名就是实际效果，比别的下拉框长，要宽到能在一行里放下最长的那个
+						style={{ width: 250 }}
 					/>
 				}
 			/>
