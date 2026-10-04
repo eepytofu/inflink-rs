@@ -49,9 +49,9 @@ export const discordAppNameModeTypeAtom =
 
 export const DISCORD_THIRD_LINES: readonly DiscordThirdLine[] = [
 	"Album",
-	"TierAndAlbum",
-	"Full",
 	"Compact",
+	"QualityAndAlbum",
+	"Full",
 ];
 
 export const discordThirdLineAtom = atomWithStorage<DiscordThirdLine>(
@@ -64,8 +64,8 @@ export const discordThirdLineAtom = atomWithStorage<DiscordThirdLine>(
  * 所以存储里残留的旧取值要先换回默认值
  */
 export function toThirdLine(value: unknown): DiscordThirdLine {
-	// 只显示档位的选项已经并入“档位 · 专辑名”
-	if (value === "Tier") return "TierAndAlbum";
+	// 带档位名字的两个选项已经换成“音质 · 专辑名”
+	if (value === "Tier" || value === "TierAndAlbum") return "QualityAndAlbum";
 	return DISCORD_THIRD_LINES.find((v) => v === value) ?? "Album";
 }
 

@@ -285,15 +285,15 @@ const fn default_true() -> bool {
 pub enum DiscordThirdLine {
     #[default]
     Album,
-    /// `Lossless · 专辑名`
-    ///
-    /// 以前还有一个只显示档位的 `Tier`, 存储里残留的旧取值按这一项处理
-    #[serde(alias = "Tier")]
-    TierAndAlbum,
-    /// `FLAC 24-bit/48 kHz, 1695 kbps`
-    Full,
     /// `FLAC 24-bit/48 kHz`、`AAC 256 kbps`
     Compact,
+    /// `FLAC 24-bit/48 kHz · 专辑名`
+    ///
+    /// 以前带档位名字的 `Tier` 和 `TierAndAlbum` 已经取消, 存储里残留的旧取值按这一项处理
+    #[serde(alias = "Tier", alias = "TierAndAlbum")]
+    QualityAndAlbum,
+    /// `FLAC 24-bit/48 kHz, 1695 kbps`
+    Full,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]

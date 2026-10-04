@@ -44,7 +44,7 @@ const zh = {
 	customNamePlaceholder: "自定义名称...",
 	thirdLine: "第三行内容",
 	thirdLineDesc:
-		"音质是网易云实际下发的档位和规格，可能与你选择的不同，读取不到时显示专辑名",
+		"音质是网易云实际下发的规格，可能与你选择的不同，读取不到时显示专辑名",
 	artistSeparator: "歌手分隔符",
 	artistSeparatorDesc: "有多位歌手时用来分隔歌手名",
 	showTranslation: "显示翻译名",
@@ -110,7 +110,7 @@ const en: Dictionary = {
 	customNamePlaceholder: "Custom name...",
 	thirdLine: "Third line",
 	thirdLineDesc:
-		"Quality is the tier and specs NetEase actually delivered, which may differ from what you selected. Falls back to the album name when unknown",
+		"Quality is what NetEase actually delivered, which may differ from what you selected. Falls back to the album name when unknown",
 	artistSeparator: "Artist separator",
 	artistSeparatorDesc: "Separates artist names when there are several",
 	showTranslation: "Show translated names",
