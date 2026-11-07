@@ -65,6 +65,8 @@ function build() {
 	execFileSync(process.execPath, [vite, "build"], {
 		cwd: frontendDir,
 		stdio: "inherit",
+		// The running client still has its plugin loaded.
+		env: { ...process.env, INFLINK_SKIP_PLUGIN_SYNC: "1" },
 	});
 }
 

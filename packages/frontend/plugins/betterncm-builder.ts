@@ -62,6 +62,8 @@ export function betterNcmBuilder(
 				path.join(DIST_DIR, "preview.png"),
 			);
 
+			if (process.env.INFLINK_SKIP_PLUGIN_SYNC === "1") return;
+
 			console.log(`\n🔄 同步构建产物到插件目录: ${PLUGIN_DIR}`);
 			await mkdir(PLUGIN_DIR, { recursive: true });
 
