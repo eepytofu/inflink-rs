@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { INcmAdapter, InternalEventMap } from "@/adapters/adapter";
 import type { PaletteMode } from "@/hooks/useNcmTheme";
+import { useT } from "@/i18n";
 import type {
 	PlaybackEventMap,
 	PlaybackStatus,
@@ -60,12 +61,18 @@ function useDebugData(adapter: INcmAdapter | null): DebugData {
 			setData((prev) => ({ ...prev, playbackStatus: e.detail }));
 		const onRawTimelineUpdate = (e: PlaybackEventMap["rawTimelineUpdate"]) =>
 			setData((prev) => ({ ...prev, timelineInfo: e.detail }));
+		const onTimeline = (e: InternalEventMap["timeline"]) => {
+			if (e.detail.reason === "seek") {
+				setData((prev) => ({ ...prev, timelineInfo: e.detail }));
+			}
+		};
 		const onPlayModeChange = (e: PlaybackEventMap["playModeChange"]) =>
 			setData((prev) => ({ ...prev, playMode: e.detail }));
 		const onVolumeChange = (e: PlaybackEventMap["volumeChange"]) =>
 			setData((prev) => ({ ...prev, volumeInfo: e.detail }));
 
 		adapter.internal.addEventListener("track", onTrack);
+		adapter.internal.addEventListener("timeline", onTimeline);
 		adapter.addEventListener("playStateChange", onPlayStateChange);
 		adapter.addEventListener("rawTimelineUpdate", onRawTimelineUpdate);
 		adapter.addEventListener("playModeChange", onPlayModeChange);
@@ -73,6 +80,7 @@ function useDebugData(adapter: INcmAdapter | null): DebugData {
 
 		return () => {
 			adapter.internal.removeEventListener("track", onTrack);
+			adapter.internal.removeEventListener("timeline", onTimeline);
 			adapter.removeEventListener("playStateChange", onPlayStateChange);
 			adapter.removeEventListener("rawTimelineUpdate", onRawTimelineUpdate);
 			adapter.removeEventListener("playModeChange", onPlayModeChange);
@@ -107,6 +115,7 @@ function DebugRow({
 	value: ReactNode;
 	mono?: boolean;
 }) {
+	const { debug } = useT();
 	const valueRef = useRef<HTMLSpanElement>(null);
 	const [copied, setCopied] = useState(false);
 
@@ -137,8 +146,8 @@ function DebugRow({
 				className={styles.copyButton}
 				disabled={value == null}
 				onClick={handleCopy}
-				aria-label="复制"
-				title="复制"
+				aria-label={debug.copy}
+				title={debug.copy}
 			>
 				{copied ? <Check size={12} /> : <Copy size={12} />}
 			</button>
@@ -162,6 +171,8 @@ export function DebugPanel({
 	theme: PaletteMode;
 	onClose: () => void;
 }) {
+	const t = useT();
+	const { debug } = t;
 	const data = useDebugData(adapter);
 
 	const panelRef = useRef<HTMLDivElement>(null);
@@ -227,64 +238,68 @@ export function DebugPanel({
 				onPointerUp={handleHeaderPointerUp}
 				onPointerCancel={handleHeaderPointerUp}
 			>
-				<h4 className={styles.title}>调试面板</h4>
+				<h4 className={styles.title}>{t.debugPanel}</h4>
 				<button
 					type="button"
 					className={styles.closeButton}
 					onClick={onClose}
-					aria-label="关闭"
+					aria-label={t.close}
 				>
 					<X size={16} />
 				</button>
 			</div>
 
 			<div className={styles.content}>
-				<DebugSection title="歌曲信息">
-					<DebugRow label="歌曲名称" value={data.songInfo?.songName} />
-					<DebugRow label="专辑名称" value={data.songInfo?.albumName} />
-					<DebugRow label="艺术家" value={data.songInfo?.authorName} />
-					<DebugRow label="歌曲 ID" value={data.songInfo?.ncmId} mono />
+				<DebugSection title={debug.track}>
+					<DebugRow label={t.optSong} value={data.songInfo?.songName} />
+					<DebugRow label={t.optAlbum} value={data.songInfo?.albumName} />
+					<DebugRow label={t.optArtist} value={data.songInfo?.authorName} />
+					<DebugRow label={debug.trackId} value={data.songInfo?.ncmId} mono />
 					<DebugRow
-						label="总时长"
+						label={debug.duration}
 						value={formatMs(data.songInfo?.duration)}
 						mono
 					/>
 				</DebugSection>
 
-				<DebugSection title="播放状态">
-					<DebugRow label="播放 / 暂停" value={data.playbackStatus} mono />
+				<DebugSection title={debug.playbackStatus}>
+					<DebugRow label={debug.playPause} value={data.playbackStatus} mono />
 				</DebugSection>
 
-				<DebugSection title="播放进度">
+				<DebugSection title={debug.progress}>
 					<DebugRow
-						label="当前时间"
+						label={debug.position}
 						value={formatMs(data.timelineInfo?.currentTime)}
 						mono
 					/>
 					<DebugRow
-						label="总时长"
+						label={debug.duration}
 						value={formatMs(data.timelineInfo?.totalTime)}
 						mono
 					/>
 				</DebugSection>
 
-				<DebugSection title="播放模式">
+				<DebugSection title={debug.playMode}>
 					<DebugRow
-						label="随机播放"
+						label={debug.shuffle}
 						value={
 							data.playMode == null
 								? null
 								: data.playMode.isShuffling
-									? "开启"
-									: "关闭"
+									? debug.on
+									: debug.off
 						}
 					/>
-					<DebugRow label="循环模式" value={data.playMode?.repeatMode} mono />
+					<DebugRow
+						label={debug.repeat}
+						value={data.playMode?.repeatMode}
+						mono
+					/>
 				</DebugSection>
 
-				<DebugSection title="音量">
+				<DebugSection title={debug.volume}>
 					<DebugRow
-						label="音量"
+						label={debug.volume}
 						value={
 							data.volumeInfo == null
 								? null
@@ -293,13 +308,13 @@ export function DebugPanel({
 						mono
 					/>
 					<DebugRow
-						label="静音"
+						label={debug.muted}
 						value={
 							data.volumeInfo == null
 								? null
 								: data.volumeInfo.isMuted
-									? "是"
-									: "否"
+									? debug.yes
+									: debug.no
 						}
 					/>
 				</DebugSection>
