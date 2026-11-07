@@ -50,7 +50,7 @@ export default defineConfig(({ command, mode }) => {
 				port: HMR_PORT,
 				strictPort: true,
 				cors: {
-					origin: true,
+					origin: process.env.INFLINK_DEV_ORIGIN || "orpheus://orpheus",
 				},
 			},
 		};
