@@ -2,14 +2,17 @@ import { Check, Copy, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { INcmAdapter, InternalEventMap } from "@/adapters/adapter";
+import type {
+	INcmAdapter,
+	InternalEventMap,
+	TrackSnapshot,
+} from "@/adapters/adapter";
 import type { PaletteMode } from "@/hooks/useNcmTheme";
 import { useT } from "@/i18n";
 import type {
 	PlaybackEventMap,
 	PlaybackStatus,
 	PlayMode,
-	SongInfo,
 	TimelineInfo,
 	VolumeInfo,
 } from "@/types/api";
@@ -17,7 +20,7 @@ import { copyTextToClipboard } from "@/utils/clipboard";
 import styles from "./index.module.css";
 
 interface DebugData {
-	songInfo: SongInfo | null;
+	track: TrackSnapshot | null;
 	playbackStatus: PlaybackStatus | null;
 	timelineInfo: TimelineInfo | null;
 	playMode: PlayMode | null;
@@ -25,7 +28,7 @@ interface DebugData {
 }
 
 const INITIAL_DATA: DebugData = {
-	songInfo: null,
+	track: null,
 	playbackStatus: null,
 	timelineInfo: null,
 	playMode: null,
@@ -41,10 +44,13 @@ function useDebugData(adapter: INcmAdapter | null): DebugData {
 	const [data, setData] = useState<DebugData>(INITIAL_DATA);
 
 	useEffect(() => {
-		if (!adapter) return;
+		if (!adapter) {
+			setData(INITIAL_DATA);
+			return;
+		}
 
 		setData({
-			songInfo: adapter.getTrackSnapshot()?.song ?? null,
+			track: adapter.getTrackSnapshot(),
 			playbackStatus: adapter.getPlaybackStatus(),
 			timelineInfo: adapter.getTimelineInfo(),
 			playMode: adapter.getPlayMode(),
@@ -54,9 +60,11 @@ function useDebugData(adapter: INcmAdapter | null): DebugData {
 		const onTrack = (e: InternalEventMap["track"]) =>
 			setData((prev) => ({
 				...prev,
-				songInfo: e.detail.song,
+				track: e.detail,
 				timelineInfo: adapter.getTimelineInfo(),
 			}));
+		const onAudioInfoChange = () =>
+			setData((prev) => ({ ...prev, track: adapter.getTrackSnapshot() }));
 		const onPlayStateChange = (e: PlaybackEventMap["playStateChange"]) =>
 			setData((prev) => ({ ...prev, playbackStatus: e.detail }));
 		const onRawTimelineUpdate = (e: PlaybackEventMap["rawTimelineUpdate"]) =>
@@ -73,6 +81,7 @@ function useDebugData(adapter: INcmAdapter | null): DebugData {
 
 		adapter.internal.addEventListener("track", onTrack);
 		adapter.internal.addEventListener("timeline", onTimeline);
+		adapter.addEventListener("audioInfoChange", onAudioInfoChange);
 		adapter.addEventListener("playStateChange", onPlayStateChange);
 		adapter.addEventListener("rawTimelineUpdate", onRawTimelineUpdate);
 		adapter.addEventListener("playModeChange", onPlayModeChange);
@@ -81,6 +90,7 @@ function useDebugData(adapter: INcmAdapter | null): DebugData {
 		return () => {
 			adapter.internal.removeEventListener("track", onTrack);
 			adapter.internal.removeEventListener("timeline", onTimeline);
+			adapter.removeEventListener("audioInfoChange", onAudioInfoChange);
 			adapter.removeEventListener("playStateChange", onPlayStateChange);
 			adapter.removeEventListener("rawTimelineUpdate", onRawTimelineUpdate);
 			adapter.removeEventListener("playModeChange", onPlayModeChange);
@@ -174,6 +184,8 @@ export function DebugPanel({
 	const t = useT();
 	const { debug } = t;
 	const data = useDebugData(adapter);
+	const song = data.track?.song;
+	const audio = data.track?.audio;
 
 	const panelRef = useRef<HTMLDivElement>(null);
 	const dragStateRef = useRef<{
@@ -251,13 +263,45 @@ export function DebugPanel({
 
 			<div className={styles.content}>
 				<DebugSection title={debug.track}>
-					<DebugRow label={t.optSong} value={data.songInfo?.songName} />
-					<DebugRow label={t.optAlbum} value={data.songInfo?.albumName} />
-					<DebugRow label={t.optArtist} value={data.songInfo?.authorName} />
-					<DebugRow label={debug.trackId} value={data.songInfo?.ncmId} mono />
+					<DebugRow label={t.optSong} value={song?.songName} />
+					{song?.transName && (
+						<DebugRow label={debug.translatedSong} value={song.transName} />
+					)}
+					<DebugRow label={t.optAlbum} value={song?.albumName} />
+					{song?.albumTransName && (
+						<DebugRow
+							label={debug.translatedAlbum}
+							value={song.albumTransName}
+						/>
+					)}
+					<DebugRow label={t.optArtist} value={song?.authorName} />
+					<DebugRow label={debug.trackId} value={song?.ncmId} mono />
 					<DebugRow
 						label={debug.duration}
-						value={formatMs(data.songInfo?.duration)}
+						value={formatMs(song?.duration)}
+						mono
+					/>
+				</DebugSection>
+
+				<DebugSection title={debug.deliveredAudio}>
+					<DebugRow
+						label={debug.codec}
+						value={audio?.codec?.toUpperCase()}
+						mono
+					/>
+					<DebugRow
+						label={debug.bitrate}
+						value={audio?.bitrate && `${Math.round(audio.bitrate / 1000)} kbps`}
+						mono
+					/>
+					<DebugRow
+						label={debug.sampleRate}
+						value={audio?.sampleRate && `${audio.sampleRate / 1000} kHz`}
+						mono
+					/>
+					<DebugRow
+						label={debug.bitDepth}
+						value={audio?.bitDepth && `${audio.bitDepth}-bit`}
 						mono
 					/>
 				</DebugSection>
