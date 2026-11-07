@@ -351,6 +351,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 				ncmId: ncmId,
 				duration: getDuration(),
 				type: "local",
+				trackId: songData.id || trackObject?.uiOpts?.playId || undefined,
 			};
 		}
 
@@ -368,6 +369,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 					ncmId: programCache.id,
 					duration: getDuration(),
 					type: "podcast",
+					trackId: String(programCache.id || songData.programId),
 				};
 			}
 
@@ -381,6 +383,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 				ncmId: songData.programId,
 				duration: getDuration(),
 				type: "podcast",
+				trackId: String(songData.programId || songData.id),
 			};
 		}
 
@@ -396,6 +399,7 @@ export class V2NcmAdapter extends BaseNcmAdapter {
 			albumId: parseCatalogId(songData.album?.id),
 			alias: songData.alias?.length ? songData.alias : undefined,
 			type: "song",
+			trackId: String(songData.id),
 		};
 	}
 

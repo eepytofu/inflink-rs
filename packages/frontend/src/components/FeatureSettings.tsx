@@ -5,6 +5,7 @@
 
 import { useAtom } from "jotai";
 import {
+	Activity,
 	AudioLines,
 	AudioWaveform,
 	Bug,
@@ -28,6 +29,8 @@ import type {
 	DiscordDisplayMode,
 	DiscordThirdLine,
 } from "@/types/backend";
+import type { INcmAdapter } from "../adapters/adapter";
+import type { PaletteMode } from "../hooks/useNcmTheme";
 import { LANGUAGE_OPTIONS, type Language, useT } from "../i18n";
 import {
 	backendLogLevelAtom,
@@ -50,12 +53,20 @@ import {
 import type { LogLevel } from "../utils/logger";
 import { AnimatedLink } from "./AnimatedLink";
 import { Combobox } from "./Combobox";
+import { DebugPanel } from "./DebugPanel";
 import styles from "./FeatureSettings.module.css";
 import { Input } from "./Input";
 import { SettingItem } from "./SettingItem";
 import { Switch } from "./Switch";
 
-export function FeatureSettings() {
+export function FeatureSettings({
+	adapter,
+	theme,
+}: {
+	adapter: INcmAdapter | null;
+	theme: PaletteMode;
+}) {
+	const [debugOpen, setDebugOpen] = useState(false);
 	const t = useT();
 	const [language, setLanguage] = useAtom(languageAtom);
 
@@ -398,6 +409,21 @@ export function FeatureSettings() {
 				}
 			/>
 
+			<SettingItem
+				icon={<Activity size={20} />}
+				title={t.debugPanel}
+				description={t.debugPanelDesc}
+				action={
+					<button
+						type="button"
+						className={styles.openButton}
+						onClick={() => setDebugOpen(true)}
+					>
+						{t.openDebugPanel}
+					</button>
+				}
+			/>
+
 			{import.meta.env.DEV ? (
 				<SettingItem
 					icon={<Bug size={20} />}
@@ -411,6 +437,14 @@ export function FeatureSettings() {
 					}
 				/>
 			) : null}
+
+			{debugOpen && (
+				<DebugPanel
+					adapter={adapter}
+					theme={theme}
+					onClose={() => setDebugOpen(false)}
+				/>
+			)}
 		</div>
 	);
 }

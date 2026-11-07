@@ -38,6 +38,7 @@ InfLink-rs 是一个为**网易云音乐**桌面客户端（基于 BetterNCM 插
    - **V3 适配器**：遍历 React Fiber 树，或使用内部 `dva` 工具定位 Redux store。通过订阅状态变更来检测切歌、音量变化与播放状态。
    - **V2 适配器**：与更老的混淆 API 端点（`playerInstance.KJ`）及不同的 Redux store 交互。
 2. **事件监听**：适配器监听网易云内部的特定事件（进度更新、跳转操作），并归一化为标准的 `SongInfo` / `TimelineInfo` 格式。
+3. **SMTC 显示决策**：`useBackendConnection` 是"媒体卡片何时亮起"的唯一决策者。`activateSmtcIfNeeded()` 是全项目唯一发出 `EnableSmtc` 的收口。约束细则见下方 D 节。
 
 ### B. 原生桥梁（FFI 与 CEF）
 
@@ -51,10 +52,22 @@ InfLink-rs 是一个为**网易云音乐**桌面客户端（基于 BetterNCM 插
    `SystemMediaTransportControls` 实例通过
    `ISystemMediaTransportControlsInterop::GetForWindow` 获取，并绑定到一个隐藏的顶层窗口上；
    该窗口由 `smtc_window.rs` 在自己的线程中创建（同时创建该窗口所需的消息泵）。
-   - 接收来自前端的元数据更新并推送到 Windows 系统媒体传输控件。
-   - 为 Windows 媒体按键设置事件处理器：按键被按下时触发回调，向前端发送消息以执行命令（如 `adapter.play()`）。
+   - 后端是纯转发的中间人，不做任何业务决策：`EnableSmtc` / `DisableSmtc` 是字面量开关（直接 `SetIsEnabled`），元数据/时间线/播放状态/播放模式原样写入会话。
+   - SMTC 会话随 dispatcher 常驻，由元数据更新或 `EnableSmtc` 懒创建（`DisableSmtc` 在会话不存在时跳过、不创建）；`DisableSmtc` 只隐藏卡片、不销毁会话，隐藏期间各 `update_*` 不检查启用状态、照常写入，因此重新启用时展示的就是当前歌曲。
+   - 为 Windows 媒体按键设置事件处理器：按键被按下时触发回调，向前端发送消息以执行命令（如 `adapter.play()`）。回调（`GLOBAL_CALLBACK`）是页面级资源，不随会话禁用注销——隐藏的会话本来就不会收到系统派发的按键。
    - 将媒体会话绑定到插件自己的窗口，正是「点击媒体卡片空白区域可将网易云音乐带到前台」的原因：系统会激活会话中记录的窗口，而该窗口过程会把激活转发给应用主窗口。
+   - 显示时序的职责划分与约束见下方 D 节。
 2. **Discord RPC**：`discord.rs` 运行后台线程连接 Discord IPC，接收元数据/时间轴负载并更新用户活动状态，包含连接重试与防抖处理以避免触发速率限制。
+
+### D. SMTC 显示时序约定
+
+以下决策是前后端的职责边界，改动相关代码时不得破坏：
+
+1. **后端零决策**：`EnableSmtc` / `DisableSmtc` 是字面量开关，后端不校验、不持有决策状态。
+2. **元数据先于可见性**：前端保证发出 `EnableSmtc` 时，当前歌的元数据必已送达后端（songChange 送达后按需开启，或经 `getResolvedCurrentSongInfo()` 补发后开启）。新增任何需要亮卡片的触发点时，必须汇入 `activateSmtcIfNeeded()` 收口，禁止另行直接发送 `EnableSmtc`。
+3. **会话常驻 + 隐藏期跟进**：`DisableSmtc` 只隐藏卡片；隐藏期间元数据/时间线照常写入是"重新开启立即显示当前歌"的前提。不要为 `update_*` 恢复启用状态检查，也不要在禁用时销毁会话或终止 dispatcher。
+4. **补发元数据仅作边界兜底**：`getResolvedCurrentSongInfo()` 只在送达记录与当前歌不一致时触发（如歌曲恢复早于监听器挂载的竞态），常规开关路径不补发。
+5. **不引入新的就绪信号**：`songChange` 事件 + `getCurrentSongInfo()` 查询已覆盖全部时机——网易云播放栏的挂载实测与适配器依赖的曲目恢复落在同一时刻（两者都等待播放器状态恢复进 Redux store），不存在更早或更稳的第三方信号，无需添加 `playerReady` 之类的事件。
 
 ## 三、技术栈
 
@@ -78,6 +91,13 @@ InfLink-rs 是一个为**网易云音乐**桌面客户端（基于 BetterNCM 插
 - **核心框架**：React + Chromium Embedded Framework
 - **包管理器**：pnpm（不要使用 npm 或其他包管理器）
 - **构建命令**：`pnpm build`
+- **前端开发（HMR）**：`pnpm dev` 启动 Vite dev server + React Fast Refresh（默认 `http://localhost:5135`，支持环境变量 `INFLINK_DEV_PORT`；dev server 只放行网易云页面的 Origin，可用 `INFLINK_DEV_ORIGIN` 覆盖），由 `inflinkHmrBootstrap` 插件在启动时编译 Rust debug DLL 并复制到插件目录（`SKIP_RUST=1` 跳过编译、直接复制现有 DLL），并自动生成引导脚本与 dev 专用 manifest（`noDevReload` 关闭 BetterNCM 的整页重载，加上移除 app.html CSP 的 hijack 规则；写入 `BETTERNCM_PLUGIN_PATH` 指向的目录，默认 `C:/betterncm/plugins_dev/InfLink-rs`，不影响仓库 manifest）。入口 `index.tsx` 导出 `mount(plugin, element)`：dev 下由引导脚本跨源加载入口模块后直接调用（显式依赖注入，模块顶层不引用 loader 注入的裸 `plugin` 全局）；生产构建则基于 `!import.meta.env.DEV` 走 loader 的 load 事件生命周期，dev/prod 共享同一份渲染逻辑。**引导脚本必须同步注册 onConfig 并立即 resolve、入口后台加载**：BetterNCM loader 在 AsyncFunction resolve 后才把 inject 推入 `injects`，且插件管理器面板挂载时会立即求值并永久缓存所有插件的 `haveConfigElement()`，若等待入口加载完成再 resolve 会导致面板缓存“无设置页”而永久禁用入口。组件级修改由 React Fast Refresh 毫秒级热更且保持状态；只被组件引用的工具模块与 hooks 会随组件热更（模块副作用重跑），其余非组件模块改动由 Vite 整页 reload。**DLL 与 hijack 的生效时机**：客户端占用 DLL 时复制会失败并只打印警告、不会重试，需退出客户端后重新运行 `pnpm dev`；hijack 规则只在客户端启动时注册，改规则或从 `pnpm build` 切回 `pnpm dev` 后都需完全重启客户端。
+- **构建插件体系**：Vite 插件及辅助构建脚本集中维护于 `packages/frontend/plugins/`，统一从 `index.ts` 导入：
+  - `inflink-hmr-bootstrap.ts`：开发环境 HMR 引导脚本生成、dev manifest 注入及 debug DLL 复制；
+  - `betterncm-builder.ts`：生产打包时 Rust release 编译、`dist` 产物补全与 BetterNCM 插件目录全量同步；
+  - `constants.ts`：集中管理前端/根目录路径、插件目录、HMR 端口与 Origin、hijack 规则；
+  - `rust.ts`：维护架构表（`RUST_TARGETS`）并提供 Rust 双架构编译（`buildRust`）与 DLL 复制（`copyDlls`）通用函数。
+- **生产构建**：`pnpm build` 编译 Rust（`SKIP_RUST=1` 跳过）并构建前端，产物**总是同步到插件目录**（会覆盖 dev 引导产物，下次 `pnpm dev` 再生成）。
 - **远程调试**：排查客户端启动、复现页面交互、读取运行时日志或验证插件 API 时，先读 [AI 远程调试指南](docs/remote-debugging.md)，按实机结果区分已验证项与仍需人工验证项。
 
 ## 五、代码风格与规范

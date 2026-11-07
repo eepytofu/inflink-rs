@@ -58,6 +58,8 @@ function isLogLevel(level: string): level is LogLevel {
 class NativeBackend {
 	private isActive = false;
 	private coverGeneration = 0;
+	private beforeunloadRegistered = false;
+	private controlHandler: ((msg: BackendEvent) => void) | null = null;
 
 	private call<K extends keyof NativeApiMap>(
 		func: K,
@@ -73,10 +75,12 @@ class NativeBackend {
 	private dispatch<T extends keyof AppMessage>(
 		type: T,
 		payload: AppMessage[T],
-	) {
-		this.handleCommandResult(
-			type as string,
-			this.call("dispatch", [JSON.stringify({ type, payload })]),
+	): boolean {
+		return (
+			this.handleCommandResult(
+				type as string,
+				this.call("dispatch", [JSON.stringify({ type, payload })]),
+			)?.status === "Success"
 		);
 	}
 
@@ -116,26 +120,45 @@ class NativeBackend {
 		}
 	}
 
+	/**
+	 * 连接后端（幂等）
+	 *
+	 * dispatcher 与 SMTC 会话随页面常驻：SMTC/Discord 的开关只是隐藏会话或
+	 * 断开 RPC，不会走到 terminate，因此重复调用 initialize 时不必重建后端，
+	 * 只需重新注册回调 —— control_handler 可能绑定的是新的 adapter 实例，
+	 * 后端只保留最后一次注册的回调。
+	 */
 	public initialize(control_handler: (msg: BackendEvent) => void) {
-		if (this.isActive) return;
-		this.call("terminate");
+		if (!this.isActive) {
+			// 防御性终止: 清理上一次生命周期可能残留的后端状态
+			this.call("terminate");
+			this.isActive = true;
+			this.call("initialize");
+		}
 
-		this.isActive = true;
+		this.controlHandler = control_handler;
 		this.registerLogger();
-		this.call("initialize");
+		this.registerEventCallback();
 
-		window.addEventListener("beforeunload", () => {
-			if (this.isActive) {
-				this.disableDiscordRpc();
-				this.disableSmtcSession();
-				this.call("terminate");
-			}
-		});
+		if (!this.beforeunloadRegistered) {
+			this.beforeunloadRegistered = true;
+			window.addEventListener("beforeunload", () => {
+				if (this.isActive) {
+					this.disableDiscordRpc();
+					this.disableSmtcSession();
+					this.call("terminate");
+					this.isActive = false;
+					logger.info("页面卸载，已终止后端", "Native Bridge");
+				}
+			});
+		}
+	}
 
+	private registerEventCallback() {
 		const eventCallback = (eventJson: string) => {
 			try {
 				const event: BackendEvent = JSON.parse(eventJson);
-				control_handler(event);
+				this.controlHandler?.(event);
 			} catch (e) {
 				logger.error("解析后端事件失败:", "Native Bridge", e);
 			}
@@ -192,18 +215,11 @@ class NativeBackend {
 		this.call("registerLogger", [logCallback]);
 	}
 
-	public disable() {
-		if (!this.isActive) return;
-		this.isActive = false;
-
-		this.call("terminate");
-		logger.info("已终止后端", "Native Bridge");
-	}
-
-	public enableSmtcSession() {
-		if (!this.isActive) return;
-		this.dispatch("EnableSmtc", undefined);
-		logger.info("启用 SMTC 会话", "Native Bridge");
+	public enableSmtcSession(): boolean {
+		if (!this.isActive) return false;
+		const enabled = this.dispatch("EnableSmtc", undefined);
+		if (enabled) logger.info("启用 SMTC 会话", "Native Bridge");
+		return enabled;
 	}
 
 	public disableSmtcSession() {
@@ -233,9 +249,9 @@ class NativeBackend {
 	/**
 	 * 发送切歌快照：文字、规格、播放状态和进度一次给齐，不等封面
 	 */
-	public updateTrack(snapshot: TrackSnapshot) {
-		if (!this.isActive) return;
-		this.dispatch("UpdateTrack", {
+	public updateTrack(snapshot: TrackSnapshot): boolean {
+		if (!this.isActive) return false;
+		return this.dispatch("UpdateTrack", {
 			seq: snapshot.seq,
 			metadata: this.toMetadataPayload(snapshot.song),
 			audio: snapshot.audio

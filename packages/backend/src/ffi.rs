@@ -107,6 +107,7 @@ pub unsafe extern "C" fn initialize(_args: *mut *mut c_void) -> *mut c_char {
 pub unsafe extern "C" fn terminate(_args: *mut *mut c_void) -> *mut c_char {
     safe_call(|| {
         logger::clear_callback();
+        smtc_core::unregister_event_callback();
         dispatcher::shutdown();
         ptr::null_mut()
     })

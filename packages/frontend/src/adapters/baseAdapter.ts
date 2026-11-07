@@ -19,12 +19,15 @@ import type {
 } from "@/types/api";
 import {
 	CoverManager,
+	isSameSong,
 	type TypedEventListenerOrEventListenerObject,
 	TypedEventTarget,
 } from "@/utils";
 import logger from "@/utils/logger";
 
 const TIMELINE_INTERVAL_MS = 1000;
+// The native session outlives individual adapters.
+let nextTrackSeq = 0;
 
 type AudioDataListener = TypedEventListenerOrEventListenerObject<
 	PlaybackEventMap,
@@ -50,6 +53,7 @@ export abstract class BaseNcmAdapter
 
 	protected lastDispatchedSongId: string | number | null = null;
 	protected lastDispatchedCoverUrl: string | undefined = undefined;
+	protected currentTrackId: string | null = null;
 
 	public readonly internal = new TypedEventTarget<InternalEventMap>();
 	protected trackSeq = 0;
@@ -192,28 +196,35 @@ export abstract class BaseNcmAdapter
 			return;
 		}
 
-		const isNewSong =
-			String(currentSongInfo.ncmId) !== String(this.lastDispatchedSongId);
+		const isNewSong = !isSameSong(currentSongInfo, this.currentSong);
 
 		const currentCoverUrl = currentSongInfo.cover?.url;
 		const isCoverChanged = currentCoverUrl !== this.lastDispatchedCoverUrl;
 
-		if (isNewSong || isCoverChanged) {
+		const duration = currentSongInfo.duration ?? 0;
+		const durationReady = this.musicDuration === 0 && duration > 0;
+
+		if (isNewSong || isCoverChanged || durationReady) {
+			this.currentTrackId =
+				currentSongInfo.trackId ??
+				(currentSongInfo.ncmId > 0 ? String(currentSongInfo.ncmId) : null);
 			this.lastDispatchedSongId = currentSongInfo.ncmId;
 			this.lastDispatchedCoverUrl = currentCoverUrl;
 
 			this.currentSong = currentSongInfo;
 
 			if (isNewSong) {
-				this.trackSeq++;
+				this.trackSeq = ++nextTrackSeq;
 				this.trackCover = null;
+				logger.info(
+					`曲目切换: ${currentSongInfo.songName} (trackId: ${this.currentTrackId}, ncmId: ${currentSongInfo.ncmId}, duration: ${currentSongInfo.duration}ms)`,
+					"BaseNcmAdapter",
+				);
 				this.musicPlayProgress = 0;
-				if (currentSongInfo.duration && currentSongInfo.duration > 0) {
-					this.musicDuration = currentSongInfo.duration;
-				} else {
-					this.musicDuration = 0;
-				}
+				this.musicDuration = duration;
 				this.onTrackChanged();
+			} else if (durationReady) {
+				this.musicDuration = duration;
 			}
 
 			// 后端不等封面：文字、规格和进度现在就发，封面下载好了再单独补上
@@ -222,9 +233,11 @@ export abstract class BaseNcmAdapter
 				this.internal.dispatch("track", snapshot);
 			}
 
-			if (isNewSong) {
+			if (isNewSong || durationReady) {
 				this.dispatchTimelineUpdateNow();
 			}
+
+			if (!isNewSong && !isCoverChanged) return;
 
 			const seq = this.trackSeq;
 			this.coverManager
@@ -236,11 +249,14 @@ export abstract class BaseNcmAdapter
 						this.internal.dispatch("cover", this.trackCover);
 					}
 
+					const currentSong = this.currentSong;
 					if (
-						String(result.songInfo.ncmId) === String(this.lastDispatchedSongId)
+						seq === this.trackSeq &&
+						currentSong &&
+						isSameSong(result.songInfo, currentSong)
 					) {
 						this.dispatch("songChange", {
-							...result.songInfo,
+							...currentSong,
 							cover: result.cover,
 						});
 					}
@@ -265,16 +281,52 @@ export abstract class BaseNcmAdapter
 	/**
 	 * 判定一次原生进度事件是否属于当前曲目
 	 *
-	 * playId 形如 "${songId}_${suffix}"；切歌后旧音频管线仍会短暂推送旧
+	 * playId 形如 "${trackId}_${suffix}"；切歌后旧音频管线仍会短暂推送旧
 	 * 曲目的进度，归属不符时必须丢弃，否则会把新曲的进度锚点盖回旧值。
 	 * 解析失败或尚未建立曲目标识时按旧行为放行（fail-open）。
 	 */
 	protected isProgressForCurrentTrack(playId: string | undefined): boolean {
 		if (!playId) return true;
-		const eventSongId = Number.parseInt(playId, 10);
-		if (Number.isNaN(eventSongId)) return true;
-		if (this.lastDispatchedSongId === null) return true;
-		return String(eventSongId) === String(this.lastDispatchedSongId);
+		if (
+			!this.currentTrackId &&
+			(this.lastDispatchedSongId === null || this.lastDispatchedSongId === 0)
+		) {
+			return true;
+		}
+
+		// 从 playId 提取前置 trackId（网易云格式为 ${trackId}_${suffix} 或 ${trackId}|${suffix}）
+		const separatorIndex = playId.search(/[_|]/);
+		const eventTrackId =
+			separatorIndex !== -1 ? playId.slice(0, separatorIndex) : playId;
+
+		// 1. 与当前曲目的内部轨道唯一标识匹配（适用于本地音频 40 位哈希与在线音频纯数字 ID）
+		if (this.currentTrackId) {
+			if (eventTrackId.toLowerCase() === this.currentTrackId.toLowerCase()) {
+				return true;
+			}
+			if (
+				playId.toLowerCase().startsWith(`${this.currentTrackId.toLowerCase()}_`)
+			) {
+				return true;
+			}
+		}
+
+		// 2. 与当前曲目的在线 ncmId 匹配（仅当 ncmId 为有效正整数时）
+		if (this.lastDispatchedSongId !== null && this.lastDispatchedSongId !== 0) {
+			const currentSongIdStr = String(this.lastDispatchedSongId);
+			if (
+				eventTrackId === currentSongIdStr ||
+				playId.startsWith(`${currentSongIdStr}_`)
+			) {
+				return true;
+			}
+		}
+
+		logger.debug(
+			`丢弃不属于当前曲目的进度事件: playId=${playId}, eventTrackId=${eventTrackId}, currentTrackId=${this.currentTrackId}, ncmId=${this.lastDispatchedSongId}`,
+			"BaseNcmAdapter",
+		);
+		return false;
 	}
 
 	protected updateTimeline(currentTime: number, totalTime?: number): void {

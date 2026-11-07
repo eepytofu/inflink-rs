@@ -55,6 +55,9 @@ const zh = {
 	advancedSection: "高级选项",
 	frontendLogLevel: "前端日志级别",
 	backendLogLevel: "后端日志级别",
+	debugPanel: "调试面板",
+	debugPanelDesc: "实时查看当前的播放状态数据",
+	openDebugPanel: "打开",
 	internalLogging: "内部日志转发",
 	internalLoggingDesc: "仅供调试",
 
@@ -123,6 +126,9 @@ const en: Dictionary = {
 	advancedSection: "Advanced",
 	frontendLogLevel: "Frontend log level",
 	backendLogLevel: "Backend log level",
+	debugPanel: "Debug panel",
+	debugPanelDesc: "Inspect live playback data",
+	openDebugPanel: "Open",
 	internalLogging: "Forward internal logs",
 	internalLoggingDesc: "For debugging only",
 

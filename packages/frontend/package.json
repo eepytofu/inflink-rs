@@ -1,6 +1,6 @@
 {
 	"name": "frontend",
-	"version": "3.3.0",
+	"version": "3.4.0",
 	"license": "GPL-3.0-only",
 	"type": "module",
 	"dependencies": {
@@ -13,6 +13,7 @@
 	"devDependencies": {
 		"@types/react": "^19.2.14",
 		"@types/react-dom": "^19.2.3",
+		"@vitejs/plugin-react": "^6.1.1",
 		"redux": "^5.0.1"
 	}
 }
